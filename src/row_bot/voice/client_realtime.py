@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
+import logging
 import math
 import time
 from typing import Any
@@ -21,6 +22,15 @@ from row_bot.voice.client_transport import (
     DictationOwner, LEASE_SECONDS, _CONVERSATION, _uuid,
 )
 
+logger = logging.getLogger("row_bot.voice.talk")
+
+# The hand-off tools that reach the agent, and so count as handovers.
+_HANDOVER_TOOLS = frozenset({"row_bot_agent_consult", "row_bot_agent_control"})
+# The listed voice prices (H2 R6): USD a minute heard, plus a minute spoken.
+_VOICE_PRICES = {
+    "gemini_live": (0.005, 0.018),
+    "gpt_live": (0.05, 0.0),
+}
 _EVENTS = frozenset({"connected", "disconnected", "fatal_error", "speech_started", "speech_stopped",
                      "transcript_final", "assistant_transcript_final", "function_call_ready",
                      "consult_fallback_needed", "output_started", "output_item_started", "response_done",
@@ -86,6 +96,10 @@ class _RealtimeState:
     consult_run_id: str = ""
     provider: Any = field(default=None, repr=False)
     exchange_attempted: bool = False
+    voice: str = ""
+    model: str = ""
+    started_wall: float = 0.0
+    handovers: int = 0
 
     def clear_private(self) -> None:
         self.secret = self.transcript = self.transcript_item = self.last_digest = ""
@@ -111,6 +125,38 @@ def _provider_error(exc: Exception) -> DictationError:
         if current is None:
             break
     return DictationError("realtime_provider_unavailable")
+
+
+def _format_tokens(count: int) -> str:
+    """Agent tokens as the R6 line shows them: the number, or thousands rounded half up."""
+    count = max(0, int(count))
+    return str(count) if count < 1000 else f"{int(count / 1000 + 0.5)}k"
+
+
+def _voice_cost(voice: str, minutes: float, spoken_seconds: float, reported_cost: float | None) -> float:
+    """The listed voice price for the talk, in dollars."""
+    if voice in _VOICE_PRICES:
+        heard, spoken = _VOICE_PRICES[voice]
+        return heard * max(0.0, minutes) + spoken * max(0.0, spoken_seconds) / 60.0
+    if voice == "openai_realtime":
+        return max(0.0, float(reported_cost or 0.0))
+    return 0.0
+
+
+def _cost_text(cost: float) -> str:
+    """Two decimals, rounded half up as a price list rounds (0.285 -> 0.29)."""
+    from decimal import ROUND_HALF_UP, Decimal
+
+    return str(Decimal(str(max(0.0, cost))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _ended_line(state: _RealtimeState, *, minutes: float, spoken_seconds: float,
+                tokens: int, reported_cost: float | None) -> str:
+    return (
+        f"talk ended: {state.voice}, {state.model}, {minutes:.1f} min, "
+        f"{state.handovers} handovers, {_format_tokens(tokens)} agent tokens, "
+        f"voice about ${_cost_text(_voice_cost(state.voice, minutes, spoken_seconds, reported_cost))}"
+    )
 
 
 class ClientRealtimeTransport:
@@ -176,7 +222,14 @@ class ClientRealtimeTransport:
             admitted()
             with self.coordinator._dictation_lock:
                 lease = self.coordinator._dictation_lease
-                lease.realtime = _RealtimeState(secret, self._transport._clock() + remaining, provider=provider)
+                lease.realtime = _RealtimeState(
+                    secret,
+                    self._transport._clock() + remaining,
+                    provider=provider,
+                    voice=str(getattr(provider, "provider_id", "") or ""),
+                    model=str(getattr(provider, "model", "") or ""),
+                    started_wall=self._wall_clock(),
+                )
                 lease.run_id = _generation_id(generation)
                 self.coordinator.set_active_row_bot_generation(lease.run_id)
 
@@ -431,6 +484,8 @@ class ClientRealtimeTransport:
             with self.coordinator._dictation_lock:
                 lease.state = "completed"
                 self._transport._release(lease, operation)
+                if kind == "function_call_ready" and event.name in _HANDOVER_TOOLS:
+                    state.handovers += 1
                 response = RealtimeEventResult(self._snapshot(lease), event.event_id, accepted, caption,
                     event.call_id if output else "", output, bool(result.get("silent")))
                 if not lease.revoked:
@@ -448,5 +503,24 @@ class ClientRealtimeTransport:
         validate()
         with self.coordinator._dictation_lock:
             lease = self._lease(owner, handle, active=False)
+            state = lease.realtime
+            if state is not None and state.voice:
+                self._log_ended(state)
             self._transport._invalidate(lease)
             return self._snapshot(lease)
+
+    def _log_ended(self, state: _RealtimeState) -> None:
+        """Write the one R6 line before Stop answers; never let a read stop Talk."""
+        minutes = max(0.0, (self._wall_clock() - state.started_wall) / 60.0)
+        spoken = self.coordinator.realtime_spoken_seconds
+        tokens, reported_cost = 0, None
+        try:
+            from row_bot.providers.usage_ledger import usage_summary
+
+            totals = usage_summary(since=state.started_wall)
+            tokens = int(totals.get("input_tokens", 0)) + int(totals.get("output_tokens", 0))
+            reported_cost = totals.get("cost")
+        except Exception:  # a missing or unreadable ledger must not stop Stop
+            logger.debug("usage ledger read failed while ending Talk", exc_info=True)
+        logger.info("%s", _ended_line(
+            state, minutes=minutes, spoken_seconds=spoken, tokens=tokens, reported_cost=reported_cost))

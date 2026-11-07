@@ -305,5 +305,11 @@ def test_browser_voice_uses_the_whisper_size_saved_after_start() -> None:
     (data_dir / "voice_settings.json").write_text(
         json.dumps({"whisper_model": "base"}), encoding="utf-8"
     )
+    # This test is about local Whisper sizing, so Talk must pick the local voice;
+    # the default is now Gemini Live (H2 S1).
+    (data_dir / "voice_runtime_settings.json").write_text(
+        json.dumps({"talk_provider": "local", "talk_model": "local-whisper"}),
+        encoding="utf-8",
+    )
     assert browser.speech_input_status("talk").ready
     assert service.whisper_size == "base"

@@ -9,7 +9,9 @@ def test_voice_runtime_settings_round_trip(tmp_path, monkeypatch):
     from row_bot.voice import runtime
 
     settings = runtime.load_voice_runtime_settings()
-    assert settings.talk_provider == "local"
+    assert settings.talk_provider == "gemini_live"
+    assert settings.talk_model == "gemini-3.8-live"
+    assert settings.realtime_fallback_to_local is False
     assert settings.dictation_provider == "local"
     assert settings.speech_output_provider == "local"
     assert settings.speech_output_voice == "af_heart"

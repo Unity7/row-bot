@@ -695,6 +695,10 @@ class ToolCatalogPage(WireModel):
 class SettingsChoice(WireModel):
     value: str = Field(min_length=1, max_length=128)
     label: str = Field(min_length=1, max_length=256)
+    # Set for Talk voices: whether the voice can start now, and the one line
+    # that says so ("Gemini Live: ready" / "... needs an OpenAI API key").
+    ready: bool | None = None
+    status: str | None = Field(default=None, max_length=128)
 
 
 class SettingsCredentialState(WireModel):

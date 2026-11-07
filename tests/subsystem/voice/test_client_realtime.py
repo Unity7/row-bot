@@ -212,6 +212,18 @@ def test_exact_fallback_transcript_required(runtime):
     assert all(call[0] != "submit" for call in r.calls)
 
 
+@pytest.mark.parametrize("kind", ["disconnected", "fatal_error"])
+def test_a_lost_session_stops_talk_with_one_plain_reason(runtime, kind):
+    """H2 R5: a dropped session stops Talk; nothing falls back to the local voice."""
+    r = runtime
+    handle = start(r).snapshot.handle
+    event(r, handle, kind)
+    assert not r.coordinator.is_running
+    with pytest.raises(DictationError, match="voice_session_expired"):
+        event(r, handle, "speech_started")
+    assert all(call[0] != "submit" for call in r.calls)
+
+
 def test_output_barge_in_and_exact_stop_do_not_cancel_other_work(runtime):
     r = runtime
     handle = start(r).snapshot.handle
