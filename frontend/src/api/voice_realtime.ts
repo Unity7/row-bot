@@ -1,9 +1,25 @@
 /** Transport entry for the sole packaged realtime arbiter. No UI or state store. */
-import {
-  startRealtimeRuntime,
-  type RealtimeRuntime,
-} from '../../../src/row_bot/voice/realtime_runtime.js';
+import { startRealtimeRuntime } from '../../../src/row_bot/voice/realtime_runtime.js';
+import { startGeminiLiveRuntime } from '../../../src/row_bot/voice/gemini_live_runtime.js';
 import type { DictationHandle } from './types';
+
+type AnyBrowserRuntime = {
+  session: { audio: { muted: boolean } } | null;
+  mute?(value: boolean): void;
+  stop(): Promise<void>;
+  sendFunctionOutput(
+    callId: string,
+    output: string,
+    meta?: Record<string, unknown>,
+  ): boolean;
+  sendRunEvent(text: string, meta?: Record<string, unknown>): boolean;
+  setGeneration(
+    sessionId: number,
+    threadId: string,
+    previous: string,
+    next: string,
+  ): boolean;
+};
 
 export type RealtimeSnapshot = {
   schema_version: 1;
@@ -12,14 +28,22 @@ export type RealtimeSnapshot = {
   quiesced: boolean;
   expires_in_ms: number;
   run_id: string | null;
-  transport: 'openai_realtime';
+  transport: 'openai_realtime' | 'gemini_live';
 };
 export type RealtimeStart = {
   snapshot: RealtimeSnapshot;
   client_secret: string | null;
   secret_expires_in_ms: number;
   exchange_available?: boolean;
+  model?: string;
+  connection_seconds?: number;
 };
+export type RealtimeStatus = {
+  state: string;
+  queuedMs: number;
+  connections: number;
+};
+export type RealtimeTranscriptRole = 'user' | 'assistant';
 export type RealtimeEvent = {
   event_id: string;
   type: string;
@@ -165,6 +189,8 @@ async function exchangeSdp(
 export async function openRealtimeSession(options: {
   start: RealtimeStart;
   exchange?(sdp: string, signal: AbortSignal): Promise<string>;
+  /** A fresh one-use token for the next Gemini connection (session resume). */
+  token?(): Promise<RealtimeStart>;
   signal: AbortSignal;
   current(): boolean;
   event(
@@ -172,14 +198,15 @@ export async function openRealtimeSession(options: {
     signal: AbortSignal,
   ): Promise<RealtimeEventResult>;
   onSnapshot(snapshot: RealtimeSnapshot): void;
-  onCaption(text: string): void;
+  onCaption(text: string, role?: RealtimeTranscriptRole): void;
+  onStatus?(status: RealtimeStatus): void;
   onFailure(code: string): void;
   onSession(session: RealtimeSession): void;
 }): Promise<RealtimeSession> {
   const handle = options.start.snapshot.handle;
   let secret = options.start.client_secret;
   let generation = options.start.snapshot.run_id || '';
-  let runtime: RealtimeRuntime | undefined;
+  let runtime: AnyBrowserRuntime | undefined;
   let stopped = false;
   let draining = false;
   let muted = false;
@@ -200,6 +227,7 @@ export async function openRealtimeSession(options: {
     },
     mute(value) {
       muted = value;
+      runtime?.mute?.(value);
       if (runtime?.session) runtime.session.audio.muted = value;
     },
     sendOutput(output) {
@@ -278,7 +306,10 @@ export async function openRealtimeSession(options: {
             throw new Error('voice_identity_changed');
           generation = next;
         }
-        if (reply.caption) options.onCaption(reply.caption);
+        if (reply.caption) {
+          const role = event.type === 'transcript_final' ? 'user' : 'assistant';
+          options.onCaption(reply.caption, role);
+        }
         if (reply.function_output && reply.call_id)
           runtime?.sendFunctionOutput(reply.call_id, reply.function_output, {
             thread_id: handle.conversation_id,
@@ -301,10 +332,67 @@ export async function openRealtimeSession(options: {
     }
   }
 
+  const gemini = options.start.snapshot.transport === 'gemini_live';
   const managed =
-    options.start.exchange_available === true && !!options.exchange;
+    !gemini && options.start.exchange_available === true && !!options.exchange;
   if ((!managed && !secret) || options.start.secret_expires_in_ms <= 0) {
     fail('realtime_credential_expired');
+    return session;
+  }
+  function emit(raw: Record<string, unknown>) {
+    if (!isCurrent()) return;
+    if (runtime?.session) runtime.session.audio.muted = muted;
+    if (raw.type === 'fatal_error' || raw.type === 'disconnected') {
+      fail(
+        raw.message === 'realtime_auth_unavailable' ||
+          raw.message === 'realtime_quota_or_rate_limit'
+          ? raw.message
+          : 'realtime_disconnected',
+      );
+      return;
+    }
+    try {
+      const event = projectEvent(raw);
+      if (!event) return;
+      if (pending.length >= 32) {
+        fail('voice_event_limit');
+        return;
+      }
+      pending.push(event);
+      void drain();
+    } catch {
+      fail('invalid_voice_event');
+    }
+  }
+  if (gemini) {
+    const first = secret;
+    secret = null;
+    await startGeminiLiveRuntime({
+      token: first,
+      connectionSeconds: options.start.connection_seconds || 0,
+      sessionId: handle.voice_session_id,
+      threadId: handle.conversation_id,
+      generationId: generation,
+      current: isCurrent,
+      emit,
+      onStatus: options.onStatus,
+      requestToken: async () => {
+        if (!options.token) throw new Error('voice_token_unavailable');
+        const next = await options.token();
+        const token = next.client_secret;
+        if (!token || !token.startsWith('auth_tokens/'))
+          throw new Error('realtime_credential_unavailable');
+        return {
+          token,
+          connectionSeconds:
+            next.connection_seconds || options.start.connection_seconds || 0,
+        };
+      },
+      onRuntime(value) {
+        runtime = value;
+        if (!isCurrent()) void value.stop();
+      },
+    });
     return session;
   }
   await startRealtimeRuntime({
@@ -328,31 +416,7 @@ export async function openRealtimeSession(options: {
       managed
         ? options.exchange!(sdp, network.signal)
         : exchangeSdp(sdp, key, network.signal),
-    emit(raw) {
-      if (!isCurrent()) return;
-      if (runtime?.session) runtime.session.audio.muted = muted;
-      if (raw.type === 'fatal_error' || raw.type === 'disconnected') {
-        fail(
-          raw.message === 'realtime_auth_unavailable' ||
-            raw.message === 'realtime_quota_or_rate_limit'
-            ? raw.message
-            : 'realtime_disconnected',
-        );
-        return;
-      }
-      try {
-        const event = projectEvent(raw);
-        if (!event) return;
-        if (pending.length >= 32) {
-          fail('voice_event_limit');
-          return;
-        }
-        pending.push(event);
-        void drain();
-      } catch {
-        fail('invalid_voice_event');
-      }
-    },
+    emit,
   });
   return session;
 }

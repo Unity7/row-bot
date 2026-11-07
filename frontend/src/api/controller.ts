@@ -449,6 +449,26 @@ export class ClientController {
     this.voiceHandle(scope, handle);
     return result;
   }
+  async realtimeToken(
+    scope: DictationScope,
+    handle: DictationHandle,
+    signal: AbortSignal,
+  ) {
+    this.voiceHandle(scope, handle);
+    if (!this.transport.realtimeToken)
+      throw { code: 'capability_unavailable' };
+    const result = await this.transport.realtimeToken(handle, signal);
+    this.voiceHandle(scope, handle);
+    validateWire('RealtimeStart', result);
+    if (
+      result.snapshot.handle.lease_id !== handle.lease_id ||
+      result.snapshot.handle.voice_session_id !== handle.voice_session_id ||
+      result.snapshot.handle.conversation_id !== handle.conversation_id ||
+      result.snapshot.handle.server_epoch !== handle.server_epoch
+    )
+      throw { code: 'protocol_incompatible' };
+    return result;
+  }
   async voiceRun(
     scope: DictationScope,
     mode: 'talk' | 'realtime',

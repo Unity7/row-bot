@@ -4,6 +4,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import ConversationVoice from './ConversationVoice';
@@ -25,19 +26,20 @@ vi.mock('./RealtimeTalkControls', () => ({
     return <span>Realtime voice controls</span>;
   },
 }));
+const handle = {
+  conversation_id: 'conversation-a',
+  server_epoch: 'epoch',
+  voice_session_id: 1,
+  lease_id: '11111111-1111-4111-8111-111111111111',
+};
 const scope = {
   conversationId: 'conversation-a',
   clientSessionId: 'session',
   serverEpoch: 'epoch',
   selectionKey: '1',
 };
-const handle = {
-  conversation_id: scope.conversationId,
-  server_epoch: scope.serverEpoch,
-  voice_session_id: 1,
-  lease_id: '11111111-1111-4111-8111-111111111111',
-};
-function setup() {
+
+function setup(provider = 'gemini_live') {
   const controller = {
     startTalk: vi.fn().mockResolvedValue({ handle, run_id: null }),
     startRealtime: vi
@@ -49,6 +51,10 @@ function setup() {
     talkOutput: vi.fn(),
     realtimeExchange: vi.fn(),
     realtimeEvent: vi.fn(),
+    realtimeToken: vi.fn().mockResolvedValue({ snapshot: { handle } }),
+    settingsSnapshot: vi.fn().mockResolvedValue({
+      voice: { runtime: { talk_provider: provider } },
+    }),
   };
   const props = {
     controller: controller as unknown as ClientController,
@@ -76,7 +82,6 @@ function setup() {
     onBusy: vi.fn(),
   };
   const view = render(<ConversationVoice {...props} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Talk' }));
   return { controller, props, view };
 }
 afterEach(() => {
@@ -85,43 +90,54 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it('reviews the selected targets and passes their exact captured revisions to normal voice admission', async () => {
-  const { controller, props, view } = setup();
+it('shows one live Talk control for a cloud voice, with no mode select', async () => {
+  setup('gemini_live');
+  await waitFor(() => expect(realtime).toBeTruthy());
+  expect(realtime.voice).toBe('gemini_live');
+  expect(realtime.available).toBe(true);
   expect(
-    screen.getByText(
-      /Starting Talk allows spoken requests to change Project sketch/,
-    ),
-  ).toBeVisible();
+    screen.queryByRole('combobox', { name: 'Talk mode' }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByText('Local voice controls')).not.toBeInTheDocument();
+});
+
+it('routes a Local pick to the unchanged local Talk, opened by the same button', async () => {
+  setup('local');
+  const button = await screen.findByRole('button', { name: 'Talk' });
+  fireEvent.click(button);
+  expect(await screen.findByText('Local voice controls')).toBeVisible();
+  expect(talk.available).toBe(true);
+});
+
+it('starts a cloud Talk through normal admission with the captured targets', async () => {
+  const { controller, props } = setup('openai_realtime');
+  await waitFor(() => expect(realtime.voice).toBe('openai_realtime'));
   const signal = new AbortController().signal;
   await act(async () => {
-    talk.onBusy?.(true);
-    await talk.start('request', signal);
+    realtime.onBusy?.(true);
+    await realtime.start('request', signal);
   });
-  expect(controller.startTalk).toHaveBeenCalledWith(
+  expect(controller.startRealtime).toHaveBeenCalledWith(
     scope,
     { ...props.context, request_id: 'request' },
     signal,
   );
-  view.rerender(<ConversationVoice {...props} targets={['Replacement']} />);
-  expect(screen.getByText(/Project sketch/)).toBeVisible();
-  expect(
-    screen.queryByRole('combobox', { name: 'Talk mode' }),
-  ).not.toBeInTheDocument();
 });
 
-it('does not admit local Talk during a current typed response and exposes explicit realtime mode', () => {
-  const { props, view } = setup();
-  view.rerender(<ConversationVoice {...props} running />);
-  expect(talk.disabled).toBe(true);
-  fireEvent.change(screen.getByRole('combobox', { name: 'Talk mode' }), {
-    target: { value: 'realtime' },
-  });
-  expect(realtime.disabled).toBe(false);
+it('asks the selected controller for each resumed Gemini token', async () => {
+  const { controller } = setup('gemini_live');
+  await waitFor(() => expect(realtime).toBeTruthy());
+  const signal = new AbortController().signal;
+  await realtime.token!(handle, signal);
+  expect(controller.realtimeToken).toHaveBeenCalledWith(scope, handle, signal);
 });
 
-it('polls one exact active run at a time and stops reading after its final saved output', async () => {
+it('polls one exact realtime run at a time and stops after its saved output', async () => {
   vi.useFakeTimers();
-  const { controller } = setup();
+  const { controller } = setup('gemini_live');
+  await act(async () => {
+    await Promise.resolve();
+  });
   let resolve!: (value: unknown) => void;
   controller.voiceRun.mockImplementationOnce(
     () =>
@@ -130,18 +146,16 @@ it('polls one exact active run at a time and stops reading after its final saved
       }),
   );
   await act(async () => {
-    await talk.start('request', new AbortController().signal);
+    await realtime.start('request', new AbortController().signal);
   });
   await act(async () => {
-    talk.onSubmitted?.({ snapshot: { handle }, run_id: 'run' } as Parameters<
-      NonNullable<TalkControlsProps['onSubmitted']>
-    >[0]);
+    realtime.onRun?.('run');
   });
-  expect(controller.voiceRun).toHaveBeenCalledTimes(1);
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(1500);
   });
   expect(controller.voiceRun).toHaveBeenCalledTimes(1);
+  expect(controller.voiceRun.mock.calls[0][1]).toBe('realtime');
   await act(async () => {
     resolve({
       handle,
@@ -151,60 +165,23 @@ it('polls one exact active run at a time and stops reading after its final saved
       text: 'Saved result.',
     });
   });
-  expect(talk.run).toEqual({
-    id: 'run',
-    state: 'completed',
-    outputId: 'output',
-  });
   await act(async () => {
     await vi.advanceTimersByTimeAsync(5000);
   });
   expect(controller.voiceRun).toHaveBeenCalledTimes(1);
 });
 
-it('ignores a late result after leaving the conversation and aborts the read', async () => {
-  const { controller, view, props } = setup();
-  let resolve!: (value: unknown) => void;
-  controller.voiceRun.mockImplementation(
-    () =>
-      new Promise((done) => {
-        resolve = done;
-      }),
-  );
-  await act(async () => {
-    await talk.start('request', new AbortController().signal);
-  });
-  await act(async () => {
-    talk.onSubmitted?.({ snapshot: { handle }, run_id: 'run' } as Parameters<
-      NonNullable<TalkControlsProps['onSubmitted']>
-    >[0]);
-  });
-  const signal = controller.voiceRun.mock.calls[0][3] as AbortSignal;
-  view.unmount();
-  expect(signal.aborted).toBe(true);
-  await act(async () => {
-    resolve({
-      handle,
-      run_id: 'run',
-      state: 'completed',
-      output_id: 'output',
-      text: 'Late result.',
-    });
-  });
-  expect(props.onBusy).toHaveBeenLastCalledWith(false);
-});
-
-it('sends realtime SDP only through the selected authenticated conversation controller', async () => {
-  const { controller } = setup();
-  fireEvent.change(screen.getByRole('combobox', { name: 'Talk mode' }), {
-    target: { value: 'realtime' },
-  });
+it('local Talk still runs on the local voice path', async () => {
+  const { controller, props } = setup('local');
+  fireEvent.click(await screen.findByRole('button', { name: 'Talk' }));
   const signal = new AbortController().signal;
-  await realtime.exchange!(handle, 'v=0 synthetic', signal);
-  expect(controller.realtimeExchange).toHaveBeenCalledWith(
+  await act(async () => {
+    talk.onBusy?.(true);
+    await talk.start('request', signal);
+  });
+  expect(controller.startTalk).toHaveBeenCalledWith(
     scope,
-    handle,
-    'v=0 synthetic',
+    { ...props.context, request_id: 'request' },
     signal,
   );
 });

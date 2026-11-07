@@ -1700,6 +1700,9 @@ export class HttpTransport implements ClientTransport {
       signal,
     );
   }
+  realtimeToken(handle: wire.DictationHandle, signal?: AbortSignal) {
+    return wire.realtimeToken(this.base, this.session(), handle, signal);
+  }
   voiceRun(
     mode: 'talk' | 'realtime',
     handle: wire.DictationHandle,

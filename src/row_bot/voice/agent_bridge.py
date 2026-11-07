@@ -87,6 +87,59 @@ def realtime_bridge_tool_declarations() -> list[dict[str, Any]]:
     ]
 
 
+_GEMINI_SCHEMA_TYPES = {
+    "object": "OBJECT",
+    "array": "ARRAY",
+    "string": "STRING",
+    "number": "NUMBER",
+    "integer": "INTEGER",
+    "boolean": "BOOLEAN",
+    "null": "NULL",
+}
+
+
+def _gemini_schema(value: Any) -> Any:
+    """OpenAPI types as Gemini's Schema spells them, without JSON Schema extras."""
+    if isinstance(value, list):
+        return [_gemini_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    clean: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "additionalProperties":
+            continue
+        if key == "type" and isinstance(item, str):
+            clean[key] = _GEMINI_SCHEMA_TYPES.get(item.lower(), item)
+        elif key == "properties" and isinstance(item, dict):
+            clean[key] = {name: _gemini_schema(schema) for name, schema in item.items()}
+        elif key in {"items", "anyOf"}:
+            clean[key] = _gemini_schema(item)
+        else:
+            clean[key] = item
+    return clean
+
+
+def gemini_bridge_tool_declarations() -> list[dict[str, Any]]:
+    """The same three tools shaped as Gemini Live function declarations.
+
+    Gemini declares tools under ``functionDeclarations`` and marks each one
+    NON_BLOCKING so the voice keeps listening while Row-Bot works.  Its Schema
+    types are enum names (``OBJECT``, not ``object``) and it has no
+    ``additionalProperties``.  The OpenAI declarations stay untouched: their
+    shape is the other provider's wire format.
+    """
+    declarations: list[dict[str, Any]] = []
+    for tool in realtime_bridge_tool_declarations():
+        declaration = {
+            "name": tool["name"],
+            "description": tool["description"],
+            "parameters": _gemini_schema(tool["parameters"]),
+            "behavior": "NON_BLOCKING",
+        }
+        declarations.append(declaration)
+    return declarations
+
+
 _NON_ACTIONABLE_UTTERANCES = {
     "thanks",
     "thank you",

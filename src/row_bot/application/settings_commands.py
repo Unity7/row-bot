@@ -611,7 +611,19 @@ def _write_json_setting(root: Path, page: str, field: str, value: Any) -> None:
             # by itself (H2 R5).
             from row_bot.voice.runtime import talk_model_for
 
-            _set_path(document, ("talk_model",), talk_model_for(str(value)))
+            chosen = str(value)
+            if chosen == "local":
+                # Local Talk keeps the engine it listened with before a cloud
+                # pick (Whisper or SenseVoice), never an empty model.
+                remembered = str(document.get("talk_local_model") or "")
+                current = str(document.get("talk_model") or "")
+                _set_path(document, ("talk_model",),
+                          remembered or (current if current.startswith("local-") else "") or "local-whisper")
+            else:
+                current = str(document.get("talk_model") or "")
+                if current.startswith("local-"):
+                    _set_path(document, ("talk_local_model",), current)
+                _set_path(document, ("talk_model",), talk_model_for(chosen))
             _set_path(document, ("realtime_fallback_to_local",), False)
         _write_document(path, document)
     if page == "preferences" and field == "updates.channel":

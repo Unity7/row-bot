@@ -72,7 +72,7 @@ def test_passive_adapter_and_exact_secret_replay_no_local_models(runtime):
     assert first.client_secret == "synthetic-ephemeral" and first.secret_expires_in_ms == 60_000
     assert first.snapshot.state == "connecting" and first.snapshot.quiesced
     assert start(r, request) == first
-    assert r.calls == [("secret", {"expires_after_seconds": 60})]
+    assert r.calls == [("secret", {"expires_after_seconds": 60, "reason": "start"})]
     with pytest.raises(DictationError, match="idempotency_mismatch"):
         r.transport.start(r.owner, request_id=request, validate=lambda: None)
     with pytest.raises(DictationError, match="voice_session_busy"):

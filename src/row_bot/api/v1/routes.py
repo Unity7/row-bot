@@ -2083,7 +2083,9 @@ def create_router(
             if cancelled.is_set():
                 raise ProtocolError("voice_session_expired", 410)
             value = asdict(result)
-            if mode == "realtime":
+            if mode == "realtime" and result.snapshot.transport == "openai_realtime":
+                # OpenAI exchanges the secret for an SDP answer here; Gemini's
+                # token goes to the browser because only it can open the socket.
                 value.update(
                     client_secret=None, exchange_available=bool(result.client_secret)
                 )
@@ -2292,6 +2294,23 @@ def create_router(
             validate=dictation_validation(request, current, conversation_id),
         )
         return await respond(request, voice_snapshot_dto(mode), asdict(result))
+
+    @router.post("/conversations/{conversation_id}/voice/realtime/{lease_id}/token")
+    async def voice_token(
+        conversation_id: str, lease_id: str, request: Request
+    ) -> JSONResponse:
+        current = await session(request, lane="mutation")
+        identity = await _body(request, dto.DictationIdentity, 1024)
+        handle = dictation_handle(conversation_id, lease_id, identity)
+        owner = await dictation_owner(request, current, conversation_id)
+        _, transport = browser_voice_transport(request)
+        result = await call(
+            transport.token,
+            owner,
+            handle,
+            validate=dictation_validation(request, current, conversation_id),
+        )
+        return await respond(request, dto.RealtimeStart, asdict(result))
 
     async def voice_work(
         request: Request, operation: Callable[[], Any], cancel: Callable[[], None]

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ClientController } from '../../api/controller';
 import type { DictationHandle, TalkStart, VoiceRunView } from '../../api/types';
 import type { DictationScope } from './VoiceControls';
-import { Button, Field, Select } from '../../ui/primitives';
+import { Button } from '../../ui/primitives';
 import { AudioLines } from 'lucide-react';
 import TalkControls from './TalkControls';
 import RealtimeTalkControls from './RealtimeTalkControls';
@@ -22,7 +22,7 @@ export default function ConversationVoice(props: {
   onBusy(busy: boolean): void;
 }) {
   const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<'talk' | 'realtime'>('talk');
+  const [talkProvider, setTalkProvider] = useState('gemini_live');
   const [busy, setBusy] = useState(false);
   const [active, setActive] = useState<{
     handle: DictationHandle;
@@ -40,6 +40,8 @@ export default function ConversationVoice(props: {
   );
   const controller = props.controller;
   const capturedTargets = useRef<string[]>([]);
+  const cloud = talkProvider !== 'local';
+  const mode: 'talk' | 'realtime' = cloud ? 'realtime' : 'talk';
   function busyChanged(value: boolean) {
     setBusy(value);
     latest.current.onBusy(value);
@@ -54,6 +56,22 @@ export default function ConversationVoice(props: {
     return { ...structuredClone(props.context), request_id: request };
   }
   useEffect(() => () => latest.current.onBusy(false), []);
+  // The saved Talk voice decides which single control Talk shows: the local
+  // one, or the live one for any cloud voice.  It is read from the same
+  // settings snapshot Voice settings writes, so the next press follows it.
+  useEffect(() => {
+    const abort = new AbortController();
+    if (!controller.settingsSnapshot) return () => abort.abort();
+    controller
+      .settingsSnapshot(abort.signal)
+      .then((snapshot) => {
+        if (abort.signal.aborted) return;
+        const value = snapshot.voice?.runtime?.talk_provider;
+        if (typeof value === 'string' && value) setTalkProvider(value);
+      })
+      .catch(() => undefined);
+    return () => abort.abort();
+  }, [controller, selectionKey]);
   useEffect(() => {
     if (!active?.run) return;
     const abort = new AbortController();
@@ -99,211 +117,200 @@ export default function ConversationVoice(props: {
     };
   }, [controller, scope, mode, active]);
 
+  const targetText = (busy ? capturedTargets.current : props.targets).length
+    ? `Starting Talk allows spoken requests to change ${(busy ? capturedTargets.current : props.targets).join(' and ')}. These resource targets stay fixed for this voice session.`
+    : 'No resource write targets are selected.';
+
   return (
     <div className="conversation-voice">
-      {!busy && (
-        <Button
-          iconOnly={props.compact}
-          variant="ghost"
-          className={props.chevron ? 'conversation-voice-toggle' : undefined}
-          aria-label="Talk"
-          title={
-            props.available
-              ? 'Talk: a spoken conversation'
-              : props.unavailableReason || 'Talk is unavailable'
-          }
-          aria-expanded={open}
-          onClick={() => setOpen(!open)}
-          disabled={busy || !props.available}
-        >
-          {/* Beside Dictate, Talk shows its own glyph rather than a small
-              chevron, so it reads as a way in (U28). */}
-          {props.chevron ? (
-            <AudioLines size={17} aria-hidden />
-          ) : props.compact ? (
-            <AudioLines size={18} aria-hidden />
-          ) : (
-            'Talk'
+      {cloud ? (
+        <>
+          <p className="muted voice-target-summary">{targetText}</p>
+          <RealtimeTalkControls
+            scope={scope}
+            voice={talkProvider}
+            available={props.available}
+            disabled={props.disabled || !props.context}
+            start={async (request, signal) => {
+              setError('');
+              const value = await controller.startRealtime(
+                scope,
+                context(request),
+                signal,
+              );
+              setActive({
+                handle: value.snapshot.handle,
+                run: value.snapshot.run_id,
+              });
+              return value;
+            }}
+            token={(handle, signal) =>
+              controller.realtimeToken
+                ? controller.realtimeToken(scope, handle, signal)
+                : Promise.reject({ code: 'capability_unavailable' })
+            }
+            stop={(handle) =>
+              controller.voiceControl(scope, 'realtime', handle, 'stop')
+            }
+            heartbeat={(handle, signal) =>
+              controller.voiceControl(
+                scope,
+                'realtime',
+                handle,
+                'heartbeat',
+                signal,
+              )
+            }
+            exchange={(handle, sdp, signal) =>
+              controller.realtimeExchange(scope, handle, sdp, signal)
+            }
+            event={(handle, event, signal) =>
+              controller.realtimeEvent(scope, handle, event, signal)
+            }
+            output={
+              run?.run_id && run.output_id && run.text
+                ? {
+                    id: run.output_id,
+                    runId: run.run_id,
+                    text: run.text,
+                    kind: 'final',
+                  }
+                : undefined
+            }
+            onBusy={busyChanged}
+            onRun={(runId) => {
+              setRun(null);
+              setActive((value) =>
+                value ? { ...value, run: runId } : value,
+              );
+            }}
+          />
+        </>
+      ) : (
+        <>
+          {!busy && (
+            <Button
+              iconOnly={props.compact}
+              variant="ghost"
+              className={props.chevron ? 'conversation-voice-toggle' : undefined}
+              aria-label="Talk"
+              title={
+                props.available
+                  ? 'Talk: a spoken conversation'
+                  : props.unavailableReason || 'Talk is unavailable'
+              }
+              aria-expanded={open}
+              onClick={() => setOpen(!open)}
+              disabled={busy || !props.available}
+            >
+              {props.chevron ? (
+                <AudioLines size={17} aria-hidden />
+              ) : props.compact ? (
+                <AudioLines size={18} aria-hidden />
+              ) : (
+                'Talk'
+              )}
+            </Button>
           )}
-        </Button>
-      )}
-      {open && (
-        <section
-          aria-label="Conversation voice"
-          className="surface conversation-voice-surface"
-          aria-busy={busy}
-        >
-          {busy ? (
-            <p className="muted voice-session-summary">
-              {mode === 'talk' ? 'Talk' : 'Realtime Talk'} ·{' '}
-              {capturedTargets.current.length
-                ? `Targets: ${capturedTargets.current.join(' and ')}`
-                : 'Chat only'}
-            </p>
-          ) : (
-            <>
-              <Field label="Talk mode">
-                <Select
-                  value={mode}
-                  disabled={busy}
-                  onChange={(event) => {
-                    setMode(event.target.value as 'talk' | 'realtime');
-                    setRun(null);
-                    setError('');
-                  }}
-                >
-                  <option value="talk">Talk with this conversation</option>
-                  <option value="realtime">
-                    Realtime Talk · OpenAI, paid per minute
-                  </option>
-                </Select>
-              </Field>
-              <p className="voice-intro">
-                Spoken requests use this conversation’s selected model and
-                approval settings.
-              </p>
-              <p className="muted voice-target-summary">
-                {(busy ? capturedTargets.current : props.targets).length
-                  ? `Starting Talk allows spoken requests to change ${(busy ? capturedTargets.current : props.targets).join(' and ')}. These resource targets stay fixed for this voice session.`
-                  : 'No resource write targets are selected.'}
-              </p>
-            </>
+          {open && (
+            <section
+              aria-label="Conversation voice"
+              className="surface conversation-voice-surface"
+              aria-busy={busy}
+            >
+              {busy ? (
+                <p className="muted voice-session-summary">Talk · {targetText}</p>
+              ) : (
+                <>
+                  <p className="voice-intro">
+                    Spoken requests use this conversation’s selected model and
+                    approval settings.
+                  </p>
+                  <p className="muted voice-target-summary">{targetText}</p>
+                </>
+              )}
+              <TalkControls
+                scope={scope}
+                available={props.available}
+                disabled={props.disabled || props.running || !props.context}
+                start={async (request, signal) => {
+                  setError('');
+                  const value = await controller.startTalk(
+                    scope,
+                    context(request),
+                    signal,
+                  );
+                  setActive({ handle: value.handle, run: value.run_id });
+                  return value;
+                }}
+                stop={(handle) =>
+                  controller.voiceControl(scope, 'talk', handle, 'stop')
+                }
+                heartbeat={(handle, signal) =>
+                  controller.voiceControl(
+                    scope,
+                    'talk',
+                    handle,
+                    'heartbeat',
+                    signal,
+                  )
+                }
+                transcribe={(handle, utterance, audio, signal) =>
+                  controller.transcribeTalk(
+                    scope,
+                    handle,
+                    utterance,
+                    audio,
+                    signal,
+                  )
+                }
+                output={(handle, runId, outputId, signal) =>
+                  controller.talkOutput(scope, handle, runId, outputId, signal)
+                }
+                run={
+                  run?.run_id
+                    ? {
+                        id: run.run_id,
+                        state:
+                          run.state === 'completed'
+                            ? 'completed'
+                            : ['running', 'stopping'].includes(run.state)
+                              ? 'running'
+                              : run.state === 'failed'
+                                ? 'failed'
+                                : 'cancelled',
+                        outputId: run.output_id ?? undefined,
+                      }
+                    : undefined
+                }
+                onBusy={busyChanged}
+                onSubmitted={(result) => {
+                  setRun(null);
+                  setActive({
+                    handle: result.snapshot.handle,
+                    run: result.run_id,
+                  });
+                }}
+              />
+              {props.running && !busy && (
+                <p className="voice-state-reason">
+                  Talk will be available when the current response finishes.
+                </p>
+              )}
+              {!props.context && !props.running && !busy && (
+                <p className="voice-state-reason">
+                  Choose a configured model before starting a voice
+                  conversation.
+                </p>
+              )}
+              {error && (
+                <p role="alert" className="voice-error">
+                  {error}
+                </p>
+              )}
+            </section>
           )}
-          {mode === 'talk' ? (
-            <TalkControls
-              scope={scope}
-              available={props.available}
-              disabled={props.disabled || props.running || !props.context}
-              start={async (request, signal) => {
-                setError('');
-                const value = await controller.startTalk(
-                  scope,
-                  context(request),
-                  signal,
-                );
-                setActive({ handle: value.handle, run: value.run_id });
-                return value;
-              }}
-              stop={(handle) =>
-                controller.voiceControl(scope, 'talk', handle, 'stop')
-              }
-              heartbeat={(handle, signal) =>
-                controller.voiceControl(
-                  scope,
-                  'talk',
-                  handle,
-                  'heartbeat',
-                  signal,
-                )
-              }
-              transcribe={(handle, utterance, audio, signal) =>
-                controller.transcribeTalk(
-                  scope,
-                  handle,
-                  utterance,
-                  audio,
-                  signal,
-                )
-              }
-              output={(handle, runId, outputId, signal) =>
-                controller.talkOutput(scope, handle, runId, outputId, signal)
-              }
-              run={
-                run?.run_id
-                  ? {
-                      id: run.run_id,
-                      state:
-                        run.state === 'completed'
-                          ? 'completed'
-                          : ['running', 'stopping'].includes(run.state)
-                            ? 'running'
-                            : run.state === 'failed'
-                              ? 'failed'
-                              : 'cancelled',
-                      outputId: run.output_id ?? undefined,
-                    }
-                  : undefined
-              }
-              onBusy={busyChanged}
-              onSubmitted={(result) => {
-                setRun(null);
-                setActive({
-                  handle: result.snapshot.handle,
-                  run: result.run_id,
-                });
-              }}
-            />
-          ) : (
-            <RealtimeTalkControls
-              scope={scope}
-              available={props.available}
-              disabled={props.disabled || !props.context}
-              start={async (request, signal) => {
-                setError('');
-                const value = await controller.startRealtime(
-                  scope,
-                  context(request),
-                  signal,
-                );
-                setActive({
-                  handle: value.snapshot.handle,
-                  run: value.snapshot.run_id,
-                });
-                return value;
-              }}
-              stop={(handle) =>
-                controller.voiceControl(scope, 'realtime', handle, 'stop')
-              }
-              heartbeat={(handle, signal) =>
-                controller.voiceControl(
-                  scope,
-                  'realtime',
-                  handle,
-                  'heartbeat',
-                  signal,
-                )
-              }
-              exchange={(handle, sdp, signal) =>
-                controller.realtimeExchange(scope, handle, sdp, signal)
-              }
-              event={(handle, event, signal) =>
-                controller.realtimeEvent(scope, handle, event, signal)
-              }
-              output={
-                run?.run_id && run.output_id && run.text
-                  ? {
-                      id: run.output_id,
-                      runId: run.run_id,
-                      text: run.text,
-                      kind: 'final',
-                    }
-                  : undefined
-              }
-              onBusy={busyChanged}
-              onRun={(runId) => {
-                setRun(null);
-                setActive((value) =>
-                  value ? { ...value, run: runId } : value,
-                );
-              }}
-            />
-          )}
-          {props.running && mode === 'talk' && !busy && (
-            <p className="voice-state-reason">
-              Talk will be available when the current response finishes.
-            </p>
-          )}
-          {!props.context && !props.running && !busy && (
-            <p className="voice-state-reason">
-              Choose a configured model before starting a voice conversation.
-            </p>
-          )}
-          {error && (
-            <p role="alert" className="voice-error">
-              {error}
-            </p>
-          )}
-        </section>
+        </>
       )}
     </div>
   );

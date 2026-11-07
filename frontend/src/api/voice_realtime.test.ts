@@ -242,7 +242,10 @@ it('records the admitted run transition and never sends an old run output', asyn
   const session = await openRealtimeSession(o);
   Peer.instances[0].listeners.get('open')?.();
   await flush();
-  expect(o.onCaption).toHaveBeenCalledWith('Accepted caption');
+  expect(o.onCaption).toHaveBeenCalledWith(
+    'Accepted caption',
+    'assistant',
+  );
   expect(
     session.sendOutput({
       id: 'output',

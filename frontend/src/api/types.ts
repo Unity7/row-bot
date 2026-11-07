@@ -611,6 +611,10 @@ export interface ClientTransport {
     sdp: string,
     signal?: AbortSignal,
   ): Promise<string>;
+  realtimeToken?(
+    handle: Wire.DictationHandle,
+    signal?: AbortSignal,
+  ): Promise<Wire.RealtimeStart>;
   voiceRun?(
     mode: 'talk' | 'realtime',
     handle: Wire.DictationHandle,

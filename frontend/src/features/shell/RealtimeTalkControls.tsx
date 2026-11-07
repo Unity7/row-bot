@@ -10,13 +10,19 @@ import {
   type RealtimeSession,
   type RealtimeSnapshot,
   type RealtimeStart,
+  type RealtimeStatus,
+  type RealtimeTranscriptRole,
 } from '../../api/voice_realtime';
 
 export type RealtimeTalkControlsProps = {
   scope: DictationScope;
+  /** The saved Talk voice, shown on the controls for the proof and for people. */
+  voice?: string;
   available: boolean;
   disabled?: boolean;
   start(requestId: string, signal: AbortSignal): Promise<RealtimeStart>;
+  /** A fresh one-use token for each later Gemini connection. */
+  token?(handle: DictationHandle, signal: AbortSignal): Promise<RealtimeStart>;
   exchange?(
     handle: DictationHandle,
     sdp: string,
@@ -47,7 +53,9 @@ type Attempt = {
   expiry?: ReturnType<typeof setTimeout>;
   polling: boolean;
   runId?: string;
+  gemini: boolean;
 };
+type Caption = { role: RealtimeTranscriptRole; text: string };
 
 function dispose(a: Attempt) {
   a.stopped = true;
@@ -59,10 +67,19 @@ function dispose(a: Attempt) {
 
 function failureMessage(code: unknown) {
   if (code === 'realtime_auth_unavailable')
-    return 'Realtime provider authorization failed. Review the connected provider.';
+    return 'Talk stopped: the voice provider refused the key. Check the key in Providers.';
   if (code === 'realtime_quota_or_rate_limit')
-    return 'Realtime provider quota or rate limit reached. Review provider limits before retrying.';
+    return 'Talk stopped: the voice provider hit its quota or rate limit.';
   return 'Realtime Talk stopped. Check voice readiness and the conversation before retrying.';
+}
+
+const STATES = ['idle', 'connecting', 'listening', 'thinking', 'speaking', 'stopping'];
+
+function shownState(value: string) {
+  if (STATES.includes(value)) return value;
+  if (value === 'interrupted' || value === 'connected') return 'listening';
+  if (value === 'stopped' || value === 'stopping') return 'stopping';
+  return 'connecting';
 }
 
 export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
@@ -71,15 +88,26 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
   const [caption, setCaption] = useState('');
   const [captions, setCaptions] = useState(true);
   const [speech, setSpeech] = useState(true);
+  const [history, setHistory] = useState<Caption[]>([]);
+  const [expiryMs, setExpiryMs] = useState<number>();
+  const [sessionId, setSessionId] = useState('');
+  const [connections, setConnections] = useState(0);
+  const [queuedMs, setQueuedMs] = useState(0);
   const current = useRef<Attempt | null>(null);
   const latest = useRef(props);
   latest.current = props;
   const muted = useRef(false);
+  const gemini = useRef(false);
 
   useEffect(() => {
     setState('idle');
     setMessage('');
     setCaption('');
+    setHistory([]);
+    setConnections(0);
+    setQueuedMs(0);
+    setSessionId('');
+    gemini.current = false;
     return () => {
       const a = current.current;
       current.current = null;
@@ -123,6 +151,7 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
       if (result.quiesced) {
         current.current = null;
         setState('idle');
+        setQueuedMs(0);
         latest.current.onBusy?.(false);
       }
     } catch {
@@ -148,11 +177,12 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
       return;
     }
     clearTimeout(a.expiry);
+    setExpiryMs(snapshot.expires_in_ms);
     a.expiry = setTimeout(
       () => void stop(a, 'Realtime session expired.'),
       Math.min(snapshot.expires_in_ms, 120_000),
     );
-    setState(snapshot.state);
+    if (!a.gemini) setState(shownState(snapshot.state));
     if (snapshot.run_id && snapshot.run_id !== a.runId) {
       a.runId = snapshot.run_id;
       latest.current.onRun?.(snapshot.run_id);
@@ -161,13 +191,9 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
 
   async function start() {
     if (current.current || !props.available || props.disabled) return;
-    if (
-      !globalThis.isSecureContext ||
-      !navigator.mediaDevices?.getUserMedia ||
-      typeof RTCPeerConnection === 'undefined'
-    ) {
+    if (!globalThis.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
       setMessage(
-        'Realtime Talk needs a secure browser context with microphone and WebRTC support.',
+        'Realtime Talk needs a secure browser context with microphone support.',
       );
       return;
     }
@@ -177,17 +203,25 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
       abort: new AbortController(),
       stop: props.stop,
       polling: false,
+      gemini: false,
     };
     current.current = a;
-    setState('starting');
+    setState('connecting');
     setMessage('');
     setCaption('');
+    setHistory([]);
+    setConnections(0);
+    setQueuedMs(0);
     props.onBusy?.(true);
     try {
       const result = await props.start(crypto.randomUUID(), a.abort.signal);
       if (!identity(a, result.snapshot.handle))
         throw new Error('voice_identity_changed');
       a.handle = result.snapshot.handle;
+      a.gemini = result.snapshot.transport === 'gemini_live';
+      gemini.current = a.gemini;
+      setSessionId(result.snapshot.handle.lease_id);
+      setConnections(1);
       if (!live(a)) {
         await stop(a);
         return;
@@ -208,8 +242,17 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
             a.polling = false;
           });
       }, 30_000);
+      const onStatus = (status: RealtimeStatus) => {
+        if (!live(a)) return;
+        setState(shownState(status.state));
+        setConnections(status.connections || 0);
+        setQueuedMs(Math.max(0, Math.round(status.queuedMs || 0)));
+      };
       await openRealtimeSession({
         start: result,
+        token: a.gemini
+          ? () => latest.current.token!(a.handle!, a.abort.signal)
+          : undefined,
         exchange: props.exchange
           ? (sdp, signal) => props.exchange!(a.handle!, sdp, signal)
           : undefined,
@@ -223,8 +266,12 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
           if (!live(a)) void session.stop();
         },
         onSnapshot: (snapshot) => apply(a, snapshot),
-        onCaption: (text) => {
-          if (live(a)) setCaption(text);
+        onStatus: a.gemini ? onStatus : undefined,
+        onCaption: (text, role) => {
+          if (!live(a)) return;
+          const safe = role === 'user' ? 'user' : 'assistant';
+          setCaption(text);
+          setHistory((items) => [...items, { role: safe, text }]);
         },
         onFailure: (code) => {
           if (live(a)) void stop(a, failureMessage(code));
@@ -259,14 +306,9 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
         ? 'Stopping…'
         : state === 'speaking'
           ? 'Speaking…'
-          : ['thinking', 'consulting_row_bot'].includes(state)
+          : state === 'thinking'
             ? 'Thinking…'
-            : [
-                  'listening',
-                  'connected',
-                  'user_speaking',
-                  'interrupted',
-                ].includes(state)
+            : state === 'listening'
               ? 'Listening…'
               : 'Connecting…';
   return (
@@ -275,9 +317,17 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
       role="group"
       aria-label="Realtime Talk controls"
       aria-busy={state !== 'idle'}
+      data-testid="talk-controls"
+      data-voice={props.voice || ''}
+      data-state={state}
+      data-session={sessionId}
+      data-connections={connections}
+      data-queued-ms={queuedMs}
+      data-expires-ms={expiryMs ?? ''}
     >
       {state === 'idle' ? (
         <Button
+          data-testid="talk-start"
           disabled={!props.available || props.disabled}
           onClick={() => void start()}
         >
@@ -285,6 +335,7 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
         </Button>
       ) : (
         <Button
+          data-testid="talk-stop"
           onClick={() => {
             const a = current.current;
             if (a) void stop(a);
@@ -316,13 +367,22 @@ export default function RealtimeTalkControls(props: RealtimeTalkControlsProps) {
           Realtime Talk is unavailable in this session.
         </small>
       )}
+      {captions && history.length > 0 && (
+        <ol className="voice-transcript" data-testid="talk-transcript">
+          {history.map((entry, index) => (
+            <li key={`${entry.role}-${index}`} data-role={entry.role}>
+              {entry.text}
+            </li>
+          ))}
+        </ol>
+      )}
       {captions && caption && (
         <p className="voice-caption" role="status" aria-label="Voice caption">
           {caption}
         </p>
       )}
       {message && (
-        <p role="alert" className="voice-error">
+        <p role="alert" className="voice-error" data-testid="talk-error">
           {message}
         </p>
       )}

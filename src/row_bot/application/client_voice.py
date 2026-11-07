@@ -240,13 +240,18 @@ class ClientVoiceAdmission:
 
 def realtime_provider() -> OpenAIRealtimeProvider:
     from row_bot.voice.client_transport import DictationError
+    from row_bot.voice.gemini_live import GeminiLiveProvider, gemini_voice
     from row_bot.voice.openai_realtime import OpenAIRealtimeProvider
     from row_bot.voice.runtime import load_voice_runtime_settings
 
     settings = load_voice_runtime_settings()
-    if settings.talk_provider != "openai_realtime":
-        # The other cloud voices start on their own transport in S2; until
-        # then Talk stops with one plain reason instead of falling back to
-        # the local voice (H2 R5).
-        raise DictationError("voice_provider_unavailable")
-    return OpenAIRealtimeProvider(model=settings.talk_model, voice=settings.realtime_voice)
+    if settings.talk_provider == "gemini_live":
+        import os
+
+        return GeminiLiveProvider(model=settings.talk_model,
+                                  voice=gemini_voice(settings.realtime_voice, os.environ.get("ROWBOT_GEMINI_VOICE", "")))
+    if settings.talk_provider == "openai_realtime":
+        return OpenAIRealtimeProvider(model=settings.talk_model, voice=settings.realtime_voice)
+    # GPT-Live starts on its own transport in S4; Talk stops with one plain
+    # reason instead of falling back to the local voice (H2 R5).
+    raise DictationError("voice_provider_unavailable")

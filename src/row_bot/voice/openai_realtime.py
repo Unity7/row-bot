@@ -132,6 +132,7 @@ class OpenAIRealtimeProvider:
         *,
         instructions: str = "",
         expires_after_seconds: int = 600,
+        reason: str = "",
     ) -> dict[str, Any]:
         api_key = self._api_key()
         if not api_key:
