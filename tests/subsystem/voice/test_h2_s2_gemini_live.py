@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from uuid import uuid4
 
 import pytest
@@ -95,6 +96,21 @@ def test_a_saved_openai_voice_is_not_sent_to_gemini(monkeypatch):
     assert posted[0]["bidiGenerateContentSetup"]["generationConfig"]["speechConfig"][
         "voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] == "Kore"
     assert gemini_live.gemini_voice("Kore") == "Kore"
+
+
+def test_a_saved_gemini_model_is_the_one_locked_and_logged(monkeypatch, caplog):
+    from row_bot.voice import gemini_live
+
+    posted = []
+    monkeypatch.setattr(gemini_live.requests, "post",
+                        lambda url, **kwargs: posted.append(kwargs["json"]) or _Response({"name": "auth_tokens/x"}))
+    caplog.set_level(logging.INFO, logger="row_bot.voice.talk")
+    provider = gemini_live.GeminiLiveProvider(api_key="synthetic", model="gemini-3.8-flash")
+
+    assert provider.token_payload()["bidiGenerateContentSetup"]["model"] == "models/gemini-3.8-flash"
+    provider.create_client_secret()
+    assert posted[0]["bidiGenerateContentSetup"]["model"] == "models/gemini-3.8-flash"
+    assert caplog.records[-1].getMessage().startswith("gemini token minted: model=gemini-3.8-flash ")
 
 
 def test_the_start_answer_names_gemini_and_openai(runtime, monkeypatch):  # noqa: F811
@@ -205,6 +221,8 @@ def test_cancel_says_stopped_only_after_the_confirmed_line(runtime, caplog):  # 
         seen.append(action)
         assert not [record for record in caplog.records if "talk cancel confirmed" in record.getMessage()]
         expected.stop_event.set()
+        expected.status = "stopped"
+        expected.producer_done.set()
         return {"control": "cancel", "status": "cancelled"}
 
     r.adapter._control = control
@@ -218,6 +236,104 @@ def test_cancel_says_stopped_only_after_the_confirmed_line(runtime, caplog):  # 
     assert json.loads(result.function_output)["speakable"] == "Stopped."
     line = [record.getMessage() for record in caplog.records if "talk cancel confirmed" in record.getMessage()]
     assert line == [
+        "talk cancel confirmed: voice=gemini_live run=run-1 via=conversation.stop status=stopped"
+    ]
+
+
+def _consult(r, handle):
+    asyncio.run(r.adapter.event(
+        r.owner, handle,
+        RealtimeEvent(str(uuid4()), "function_call_ready", call_id="consult",
+                      name="row_bot_agent_consult", arguments='{"request":"Go through every project"}'),
+        validate=lambda: None,
+    ))
+
+
+def _cancel(r, handle):
+    return asyncio.run(r.adapter.event(
+        r.owner, handle,
+        RealtimeEvent(str(uuid4()), "function_call_ready", generation_id="run-1", call_id="cancel",
+                      name="row_bot_agent_control", arguments='{"action":"cancel"}'),
+        validate=lambda: None,
+    ))
+
+
+def test_cancel_still_stopping_when_the_run_ends_late_but_in_time(runtime, caplog, monkeypatch):  # noqa: F811
+    from row_bot.voice import client_realtime
+
+    monkeypatch.setattr(client_realtime, "CANCEL_CONFIRM_SECONDS", 2.0)
+    r = runtime
+    r.provider.provider_id = "gemini_live"
+    r.provider.model = "gemini-3.8-live"
+    handle = start(r).snapshot.handle
+    _consult(r, handle)
+    caplog.set_level(logging.INFO, logger="row_bot.voice.talk")
+
+    def control(owner, expected, action, text, event_id, validate):
+        validate()
+        expected.stop_event.set()
+
+        def finish():
+            expected.status = "stopped"
+            expected.producer_done.set()
+
+        threading.Timer(0.2, finish).start()
+        return {"control": "cancel", "status": "cancelled"}
+
+    r.adapter._control = control
+    result = _cancel(r, handle)
+    assert json.loads(result.function_output)["status"] == "cancelled"
+    assert json.loads(result.function_output)["speakable"] == "Stopped."
+    assert [record.getMessage() for record in caplog.records if "talk cancel" in record.getMessage()] == [
+        "talk cancel confirmed: voice=gemini_live run=run-1 via=conversation.stop status=stopped"
+    ]
+
+
+def test_cancel_says_still_stopping_when_the_run_never_ends_in_time(runtime, caplog, monkeypatch):  # noqa: F811
+    from row_bot.voice import client_realtime
+
+    monkeypatch.setattr(client_realtime, "CANCEL_CONFIRM_SECONDS", 0.15)
+    r = runtime
+    r.provider.provider_id = "gemini_live"
+    r.provider.model = "gemini-3.8-live"
+    handle = start(r).snapshot.handle
+    _consult(r, handle)
+    caplog.set_level(logging.INFO, logger="row_bot.voice.talk")
+
+    def control(owner, expected, action, text, event_id, validate):
+        validate()
+        expected.stop_event.set()
+        return {"control": "cancel", "status": "cancel_requested"}
+
+    r.adapter._control = control
+    result = _cancel(r, handle)
+    assert json.loads(result.function_output)["status"] == "stopping"
+    assert json.loads(result.function_output)["speakable"] == "Still stopping."
+    lines = [record.getMessage() for record in caplog.records if "talk cancel" in record.getMessage()]
+    assert lines == [
+        "talk cancel pending: voice=gemini_live run=run-1 via=conversation.stop status=stopping"
+    ]
+
+
+def test_cancel_on_a_run_that_is_already_gone_says_stopped(runtime, caplog):  # noqa: F811
+    r = runtime
+    r.provider.provider_id = "gemini_live"
+    r.provider.model = "gemini-3.8-live"
+    handle = start(r).snapshot.handle
+    _consult(r, handle)
+    r.generation[0] = None
+    caplog.set_level(logging.INFO, logger="row_bot.voice.talk")
+
+    def control(owner, expected, action, text, event_id, validate):
+        validate()
+        assert expected is None
+        return {"control": "cancel", "status": "cancel_requested"}
+
+    r.adapter._control = control
+    result = _cancel(r, handle)
+    assert json.loads(result.function_output)["status"] == "cancelled"
+    assert json.loads(result.function_output)["speakable"] == "Stopped."
+    assert [record.getMessage() for record in caplog.records if "talk cancel" in record.getMessage()] == [
         "talk cancel confirmed: voice=gemini_live run=run-1 via=conversation.stop status=cancelled"
     ]
 

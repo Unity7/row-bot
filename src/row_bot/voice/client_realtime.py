@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
+import asyncio
 import hashlib
 import json
 import logging
@@ -35,6 +36,9 @@ _VOICE_PRICES = {
 # Only a Gemini talk runs past the old 10-minute cap: a 20-minute talk is the
 # point of session resumption.  The lease still renews every 120 s.
 DEFAULT_GEMINI_TALK_SECONDS = 7200
+# After conversation.stop is admitted, how long the voice may wait for the run's
+# producer to finish before it says only that the run is still stopping.
+CANCEL_CONFIRM_SECONDS = 10.0
 
 
 def talk_max_seconds(voice: str) -> float:
@@ -542,13 +546,12 @@ class ClientRealtimeTransport:
                     parsed = bridge._parse_arguments(event.arguments)
                     action = str(parsed.get("action") or "status").strip().lower()
                     text = str(parsed.get("text") or "").strip()
+                    cancel_handle = generation
                     confirmed_run = _generation_id(generation) or lease.run_id
                     control_result = control(action if action in {"status", "cancel"} else "input",
                                              text or action)
                     if isinstance(control_result, dict) and control_result.get("control") == "cancel":
-                        logger.info("talk cancel confirmed: voice=%s run=%s via=conversation.stop status=cancelled",
-                                    state.voice, confirmed_run or "unknown")
-                        control_result = {"status": "cancelled", "control": "cancel", "speakable": "Stopped."}
+                        control_result = await self._cancel_result(state, cancel_handle, confirmed_run)
                     result = {"output": json.dumps(control_result, ensure_ascii=False)}
                 elif kind == "function_call_ready":
                     result = await bridge.handle_realtime_function_call(name=event.name, call_id=event.call_id,
@@ -588,6 +591,24 @@ class ClientRealtimeTransport:
         finally:
             with self.coordinator._dictation_lock:
                 self._transport._release(lease, operation)
+
+    async def _cancel_result(self, state: _RealtimeState, handle: Any, run_id: str) -> dict[str, Any]:
+        """Say "Stopped." only once the cancelled run's producer has finished (H2 S2).
+
+        The wait runs on a worker thread so the event loop keeps serving events.
+        A run that is already gone counts as finished.
+        """
+        finished = handle is None or handle.producer_done.is_set()
+        if not finished:
+            finished = await asyncio.to_thread(handle.producer_done.wait, CANCEL_CONFIRM_SECONDS)
+        if finished:
+            status = "stopped" if getattr(handle, "status", "") == "stopped" else "cancelled"
+            logger.info("talk cancel confirmed: voice=%s run=%s via=conversation.stop status=%s",
+                        state.voice, run_id or "unknown", status)
+            return {"status": "cancelled", "control": "cancel", "speakable": "Stopped."}
+        logger.info("talk cancel pending: voice=%s run=%s via=conversation.stop status=stopping",
+                    state.voice, run_id or "unknown")
+        return {"status": "stopping", "control": "cancel", "speakable": "Still stopping."}
 
     def stop(self, owner: DictationOwner, handle: DictationHandle, *, validate: Callable[[], None]) -> RealtimeSnapshot:
         validate()

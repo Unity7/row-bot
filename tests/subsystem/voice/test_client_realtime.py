@@ -33,7 +33,8 @@ def runtime():
     def submit(owner, text, event_id, validate):
         validate()
         calls.append(("submit", owner.conversation_id, text, event_id))
-        generation[0] = SimpleNamespace(generation_id="run-1", status="running", stop_event=threading.Event())
+        generation[0] = SimpleNamespace(generation_id="run-1", status="running", stop_event=threading.Event(),
+                                        producer_done=threading.Event())
         return "run-1"
 
     def control(owner, expected, action, text, event_id, validate):
@@ -42,6 +43,8 @@ def runtime():
         calls.append(("control", action, event_id))
         if action == "cancel":
             expected.stop_event.set()
+            expected.status = "stopped"
+            expected.producer_done.set()
             return {"control": "cancel", "status": "cancelled"}
         if action == "input":
             pending.append((owner.conversation_id, expected.generation_id, text, event_id))

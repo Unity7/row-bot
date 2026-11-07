@@ -33,7 +33,6 @@ GEMINI_VOICES = frozenset({
     "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird",
     "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
 })
-_ENGINE_MODEL = f"models/{DEFAULT_GEMINI_MODEL}"
 # The fields the token locks.  sessionResumption is deliberately not named: the
 # browser must be able to send the latest handle in a resumed connection's
 # setup, and a constrained sessionResumption would replace it.
@@ -113,7 +112,7 @@ class GeminiLiveProvider:
     def setup(self, *, instructions: str = "") -> dict[str, Any]:
         """The locked session setup: audio replies, the voice, tools and resumption."""
         return {
-            "model": _ENGINE_MODEL,
+            "model": f"models/{self.model}",
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {
