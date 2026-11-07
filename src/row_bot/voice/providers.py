@@ -86,9 +86,14 @@ def speech_to_text_provider(
         provider_id, model = settings.dictation_provider, settings.dictation_model
     else:
         provider_id, model = settings.talk_provider, settings.talk_model
-        if provider_id == REALTIME_TALK_PROVIDER:
-            # Browser Talk is then Realtime's local fallback, which listens with
-            # Whisper; talk_model names the realtime model, not a local one.
+        if provider_id != LOCAL_PROVIDER:
+            # A cloud voice never runs through the local factory unless the
+            # owner explicitly turned the old fallback on; it is off by default
+            # and Settings no longer offers it, so a cloud pick stops instead.
+            if not settings.realtime_fallback_to_local:
+                raise VoiceProviderError("voice_provider_unavailable")
+            # The legacy fallback listens with Whisper; talk_model names the
+            # realtime model, not a local one.
             provider_id, model = LOCAL_PROVIDER, ""
     if provider_id != LOCAL_PROVIDER:
         raise VoiceProviderError("voice_provider_unavailable")

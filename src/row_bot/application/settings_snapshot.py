@@ -424,6 +424,30 @@ def _whisper_installed(root: Path, size: str) -> bool:
         return False
 
 
+def _talk_provider_rows() -> list[dict[str, Any]]:
+    """The four Talk voices in order, each marked ready or with the missing key named."""
+    from row_bot.voice.runtime import TALK_VOICES
+
+    rows: list[dict[str, Any]] = []
+    for value, voice in TALK_VOICES.items():
+        label, key = voice["label"], voice["key"]
+        ready = not key or _credential_status(key)["configured"]
+        if ready:
+            status = f"{label}: ready"
+        elif key == "GOOGLE_API_KEY":
+            status = f"{label}: needs a Google API key"
+        else:
+            status = f"{label}: needs an OpenAI API key"
+        rows.append({"value": value, "label": label, "ready": ready, "status": status})
+    return rows
+
+
+def _talk_model_for(provider: str) -> str:
+    from row_bot.voice.runtime import talk_model_for
+
+    return talk_model_for(provider)
+
+
 def _voice(root: Path) -> dict[str, Any]:
     runtime = _mapping(_read_json(root / "voice_runtime_settings.json", default={}))
     local = _mapping(_read_json(root / "voice_settings.json", default={}))
@@ -441,11 +465,17 @@ def _voice(root: Path) -> dict[str, Any]:
         speed = max(0.5, min(2.0, float(tts.get("speed", 1.0))))
     except (TypeError, ValueError):
         speed = 1.0
+    talk_provider = _text(runtime.get("talk_provider") or "gemini_live", 64)
     return {
         "availability": "available",
         "runtime": {
-            "talk_provider": _text(runtime.get("talk_provider") or "local", 64),
-            "talk_model": _text(runtime.get("talk_model") or "local-whisper", 128),
+            "talk_provider": talk_provider,
+            "talk_model": _text(
+                runtime.get("talk_model")
+                or _talk_model_for(talk_provider)
+                or "local-whisper",
+                128,
+            ),
             "dictation_provider": _text(
                 runtime.get("dictation_provider") or "local", 64
             ),
@@ -465,7 +495,7 @@ def _voice(root: Path) -> dict[str, Any]:
             "captions_enabled": runtime.get("captions_enabled") is not False,
             "talk_auto_start": runtime.get("talk_auto_start") is True,
             "realtime_fallback_to_local": runtime.get("realtime_fallback_to_local")
-            is not False,
+            is True,
         },
         "local": {
             "whisper_model": whisper,
@@ -484,9 +514,7 @@ def _voice(root: Path) -> dict[str, Any]:
             "auto_speak": tts.get("auto_speak") is not False,
         },
         "openai_realtime_credential": _credential_status("OPENAI_API_KEY"),
-        "talk_providers": _choice_rows(
-            {"local": "Local", "openai_realtime": "OpenAI Realtime"}
-        ),
+        "talk_providers": _talk_provider_rows(),
         "dictation_providers": _choice_rows({"local": "Local"}),
         "speech_output_providers": _choice_rows({"local": "Local"}),
         "whisper_options": _choice_rows(_WHISPER_OPTIONS),
@@ -1666,8 +1694,8 @@ def _plugins(validate: Callable[[], None]) -> dict[str, Any]:
 # step with the readers.
 SETTING_DEFAULTS: dict[str, dict[str, Any]] = {
     "voice": {
-        "runtime.talk_provider": "local",
-        "runtime.talk_model": "local-whisper",
+        "runtime.talk_provider": "gemini_live",
+        "runtime.talk_model": "gemini-3.8-live",
         "runtime.dictation_provider": "local",
         "runtime.dictation_model": "local-whisper",
         "runtime.speech_output_provider": "local",
@@ -1675,7 +1703,7 @@ SETTING_DEFAULTS: dict[str, dict[str, Any]] = {
         "runtime.realtime_voice": "marin",
         "runtime.captions_enabled": True,
         "runtime.talk_auto_start": False,
-        "runtime.realtime_fallback_to_local": True,
+        "runtime.realtime_fallback_to_local": False,
         "local.whisper_model": "small",
         "tts.enabled": False,
         "tts.voice": "af_heart",

@@ -230,6 +230,7 @@ def test_dictate_and_talk_each_transcribe_with_their_saved_model(tmp_path, monke
     _save_runtime(
         monkeypatch,
         tmp_path,
+        talk_provider="local",
         dictation_model="local-funasr-sensevoice",
         talk_model="local-whisper",
     )
@@ -246,20 +247,28 @@ def test_dictate_and_talk_each_transcribe_with_their_saved_model(tmp_path, monke
     assert voice.calls == [(b"\0" * 3_200, False)]
 
 
-def test_realtime_talk_falls_back_to_whisper_whatever_dictation_uses(tmp_path, monkeypatch) -> None:
+def test_a_cloud_talk_voice_never_falls_back_to_local_whisper(tmp_path, monkeypatch) -> None:
+    """H2 R5: fallback is off by default, so a cloud pick stops instead of listening locally."""
     _save_runtime(
         monkeypatch,
         tmp_path,
         talk_provider="openai_realtime",
-        talk_model="gpt-realtime-2",
+        talk_model="gpt-realtime-2.1",
         dictation_model="local-funasr-sensevoice",
     )
     voice = _Voice()
+    service = _service(voice)
 
+    with pytest.raises(VoiceProviderError, match="voice_provider_unavailable"):
+        service.transcribe("session-a", b"encoded", "audio/webm", mode="talk")
+    assert not voice.calls and not voice.sensevoice.calls
+
+    # Local Talk still works when Local is the picked voice.
+    _save_runtime(monkeypatch, tmp_path, talk_provider="local", talk_model="local-whisper")
     assert _service(voice).transcribe("session-a", b"encoded", "audio/webm", mode="talk") == (
         "hello browser"
     )
-    assert not voice.sensevoice.calls
+    assert voice.calls == [(b"\0" * 3_200, False)]
 
 
 def test_a_selected_model_that_is_not_ready_reports_its_own_code(tmp_path, monkeypatch) -> None:

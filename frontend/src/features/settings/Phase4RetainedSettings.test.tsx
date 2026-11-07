@@ -81,7 +81,7 @@ const snapshot = {
       realtime_voice: 'alloy',
       captions_enabled: true,
       talk_auto_start: false,
-      realtime_fallback_to_local: true,
+      realtime_fallback_to_local: false,
     },
     local: {
       whisper_model: 'base',
@@ -101,8 +101,25 @@ const snapshot = {
       fingerprint: 'must-not-render',
     },
     talk_providers: [
-      { value: 'local', label: 'Local' },
-      { value: 'openai_realtime', label: 'OpenAI Realtime' },
+      {
+        value: 'gemini_live',
+        label: 'Gemini Live',
+        ready: false,
+        status: 'Gemini Live: needs a Google API key',
+      },
+      {
+        value: 'openai_realtime',
+        label: 'OpenAI Realtime',
+        ready: true,
+        status: 'OpenAI Realtime: ready',
+      },
+      {
+        value: 'gpt_live',
+        label: 'GPT-Live',
+        ready: true,
+        status: 'GPT-Live: ready',
+      },
+      { value: 'local', label: 'Local', ready: true, status: 'Local: ready' },
     ],
     dictation_providers: [{ value: 'local', label: 'Local' }],
     speech_output_providers: [{ value: 'local', label: 'Local' }],
@@ -434,11 +451,38 @@ function notice(text: string | RegExp) {
 
 it('renders real voice controls without probing a device or provider', async () => {
   renderSetting('voice');
-  expect(screen.getByLabelText('Listen with')).toHaveValue('local');
-  // The provider select says where it runs (B258).
+  const talkVoice = screen.getByTestId('talk-voice');
+  expect(talkVoice).toHaveValue('local');
+  expect(
+    within(talkVoice)
+      .getAllByRole('option')
+      .map((option) => option.getAttribute('value')),
+  ).toEqual(['gemini_live', 'openai_realtime', 'gpt_live', 'local']);
+  expect(
+    within(talkVoice)
+      .getAllByRole('option')
+      .map((option) => option.textContent),
+  ).toEqual(['Gemini Live', 'OpenAI Realtime', 'GPT-Live', 'Local']);
+  // Four Talk voices, each with one readiness line; only Dictation still says
+  // where the local engine runs.
   expect(
     screen.getAllByRole('option', { name: 'Whisper · on this computer' }),
-  ).toHaveLength(2);
+  ).toHaveLength(1);
+  const status = (voice: string) =>
+    document.querySelector(
+      `[data-testid="talk-voice-status"][data-voice="${voice}"]`,
+    );
+  expect(status('gemini_live')).toHaveTextContent(
+    'Gemini Live: needs a Google API key',
+  );
+  expect(status('openai_realtime')).toHaveTextContent(
+    'OpenAI Realtime: ready',
+  );
+  expect(status('gpt_live')).toHaveTextContent('GPT-Live: ready');
+  expect(status('local')).toHaveTextContent('Local: ready');
+  expect(screen.getByTestId('talk-voice-saved')).toHaveTextContent(
+    'Talk now uses Local',
+  );
   // The speech model isn't downloaded here: the header says what to do, not that it's ready.
   expect(
     screen.getByText('Download the speech model to talk on this computer'),
@@ -460,11 +504,13 @@ it('renders real voice controls without probing a device or provider', async () 
       name: /OpenAI Realtime API key/,
     }),
   ).toBeNull();
-  fireEvent.change(screen.getByLabelText('Listen with'), {
+  fireEvent.change(screen.getByTestId('talk-voice'), {
     target: { value: 'openai_realtime' },
   });
   expect(screen.getByLabelText('Realtime voice')).toBeVisible();
-  expect(screen.getByLabelText('Fall back to this computer')).toBeVisible();
+  // A cloud voice never falls back to the local voice (H2 R5).
+  expect(screen.queryByLabelText('Fall back to this computer')).toBeNull();
+  expect(screen.getByText('OpenAI Realtime Talk online')).toBeVisible();
   // A choice saves at once (decision 19); nothing probes a device.
   await waitFor(() =>
     expect(mutation.review).toHaveBeenCalledWith(
@@ -502,8 +548,11 @@ it('shows Realtime-only voice controls only for Realtime and hides uninstalled l
   expect(screen.getByLabelText('Live captions')).toBeChecked();
   expect(screen.getByLabelText('Realtime voice')).toHaveValue('alloy');
   // Which realtime model Talk uses stays a choice (the saved talk model names it).
-  expect(screen.getByLabelText('Realtime model')).toHaveValue('gpt-realtime-2');
-  expect(screen.getByLabelText('Fall back to this computer')).toBeChecked();
+  expect(screen.getByLabelText('Realtime model')).toHaveValue(
+    'gpt-realtime-2.1',
+  );
+  // Fallback is off and cannot be turned on (H2 R5).
+  expect(screen.queryByLabelText('Fall back to this computer')).toBeNull();
   // Kokoro's install is a text action in the Read aloud row's status line.
   expect(screen.getByText('Kokoro isn’t installed yet')).toBeVisible();
   expect(screen.queryByLabelText('Read replies aloud')).toBeNull();

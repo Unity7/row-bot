@@ -1155,6 +1155,7 @@ function SelectSetting({
   row,
   savedMessage,
   layout,
+  testId,
 }: {
   mutation: SettingsMutationIO;
   field: string;
@@ -1167,6 +1168,7 @@ function SelectSetting({
   row?: RowLook;
   savedMessage?: (value: SettingsValue) => string;
   layout?: 'row' | 'bare';
+  testId?: string;
 }) {
   const available = options.some((option) => option.value === value)
     ? options
@@ -1187,6 +1189,7 @@ function SelectSetting({
       {({ value: draft, setValue, disabled }) => (
         <Select
           aria-label={layout === 'bare' ? label : undefined}
+          data-testid={testId}
           value={String(draft)}
           disabled={disabled}
           onChange={(event) => setValue(event.target.value)}
@@ -1789,6 +1792,12 @@ export function VoiceSnapshotPanel({
   }, [mutation.drafts, mutation.page, snapshot.runtime.talk_provider]);
   const readAloudOn = snapshot.tts.installed && snapshot.tts.enabled;
   const realtime = talkProvider === 'openai_realtime';
+  const cloudVoice = talkProvider !== 'local';
+  const talkChoice = (value: string) =>
+    snapshot.talk_providers.find((option) => option.value === value);
+  const savedTalkLabel =
+    talkChoice(snapshot.runtime.talk_provider)?.label ??
+    snapshot.runtime.talk_provider;
   const localDictation = snapshot.runtime.dictation_provider === 'local';
   const size = whisperSize(
     snapshot.whisper_options,
@@ -1800,22 +1809,23 @@ export function VoiceSnapshotPanel({
       ? [{ value: SENSEVOICE_ENGINE, label: 'SenseVoice' }]
       : []),
   ];
-  // Listening on this computer needs the speech model: until it is downloaded, the header says so.
-  const missingSpeech =
-    (!realtime || localDictation) && !snapshot.local.whisper_installed;
+  // A cloud voice runs at its provider, so Talk does not need the local
+  // speech model; only a local Talk asks for Whisper (H2 R1).
+  const missingSpeech = !cloudVoice && !snapshot.local.whisper_installed;
   return (
     <div className="stack settings-snapshot-page settings-voice-page">
       <SettingsStatus
         tone={missingSpeech ? 'warning' : 'success'}
         more={[
-          realtime && localDictation ? 'dictation on this computer' : '',
+          cloudVoice ? 'voice online' : 'voice on this computer',
+          localDictation ? 'dictation on this computer' : '',
           readAloudOn ? 'read aloud on' : 'read aloud off',
         ]}
       >
         {missingSpeech
           ? 'Download the speech model to talk on this computer'
-          : realtime
-            ? 'Realtime Talk online'
+          : cloudVoice
+            ? `${talkChoice(talkProvider)?.label ?? talkProvider} Talk online`
             : localDictation
               ? 'Talk and dictation on this computer'
               : 'Talk on this computer'}
@@ -1828,24 +1838,38 @@ export function VoiceSnapshotPanel({
         <SelectSetting
           mutation={mutation}
           field="runtime.talk_provider"
-          label="Listen with"
+          label="Voice"
+          testId="talk-voice"
           hint={
-            realtime
-              ? 'Sends live microphone audio only while you are talking.'
+            cloudVoice
+              ? 'Runs at the provider while you talk; its key is never put in the page.'
               : 'On this computer keeps your voice private.'
           }
           value={snapshot.runtime.talk_provider}
           options={snapshot.talk_providers.map((option) => ({
             value: option.value,
-            label: voiceProviderLabel('listen', option),
+            label: option.label,
           }))}
           onDraftChange={setTalkProvider}
           savedMessage={(next) =>
-            next === 'openai_realtime'
-              ? 'Talk now listens with OpenAI Realtime'
-              : 'Talk now listens on this computer'
+            `Talk now uses ${talkChoice(String(next))?.label ?? String(next)}`
           }
         />
+        <ul className="settings-voice-readiness" aria-label="Talk voices">
+          {snapshot.talk_providers.map((option) => (
+            <li
+              key={option.value}
+              data-testid="talk-voice-status"
+              data-voice={option.value}
+            >
+              {option.status ??
+                `${option.label}: ${option.ready === false ? 'not ready' : 'ready'}`}
+            </li>
+          ))}
+        </ul>
+        <p data-testid="talk-voice-saved" className="muted">
+          Talk now uses {savedTalkLabel}
+        </p>
         <SwitchSetting
           mutation={mutation}
           field="runtime.captions_enabled"
@@ -1853,15 +1877,6 @@ export function VoiceSnapshotPanel({
           hint="Show your words while you speak."
           value={snapshot.runtime.captions_enabled}
         />
-        {realtime && (
-          <SwitchSetting
-            mutation={mutation}
-            field="runtime.realtime_fallback_to_local"
-            label="Fall back to this computer"
-            hint="If Realtime is unavailable, Talk listens with Whisper instead."
-            value={snapshot.runtime.realtime_fallback_to_local}
-          />
-        )}
         <SettingsItem
           label="Try it"
           help="Talk starts from a conversation’s microphone."
@@ -2022,11 +2037,11 @@ export function VoiceSnapshotPanel({
               mutation={mutation}
               field="runtime.talk_model"
               label="Realtime model"
-              hint="Leave as gpt-realtime-2 unless you need another gpt-realtime model."
+              hint="Leave as gpt-realtime-2.1 unless you need another gpt-realtime model."
               value={
                 snapshot.runtime.talk_model.startsWith('gpt-realtime')
                   ? snapshot.runtime.talk_model
-                  : 'gpt-realtime-2'
+                  : 'gpt-realtime-2.1'
               }
             />
           </SettingsGroup>

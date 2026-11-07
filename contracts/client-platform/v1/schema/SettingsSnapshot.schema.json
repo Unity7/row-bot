@@ -803,6 +803,31 @@
           "title": "Label",
           "type": "string"
         },
+        "ready": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ready"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
         "value": {
           "maxLength": 128,
           "minLength": 1,

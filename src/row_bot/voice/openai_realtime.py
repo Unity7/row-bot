@@ -15,7 +15,7 @@ from row_bot.voice.provider_base import VoiceProviderStatus
 
 CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 CALLS_URL = "https://api.openai.com/v1/realtime/calls"
-DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
+DEFAULT_REALTIME_MODEL = "gpt-realtime-2.1"
 DEFAULT_REALTIME_VOICE = "marin"
 REALTIME_VOICE_OPTIONS: dict[str, str] = {
     "alloy": "Alloy",

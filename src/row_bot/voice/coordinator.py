@@ -106,10 +106,19 @@ class VoiceSessionCoordinator:
         self._realtime_completed_speech_window_id = 0
         self._realtime_last_transcript_window_id = 0
         self._realtime_transcript_item_ids: deque[str] = deque(maxlen=200)
+        # Audio the provider actually sent, timed on this server from the
+        # output-started event to its done (or barge-in) event.
+        self._realtime_output_started_at = 0.0
+        self._realtime_spoken_seconds = 0.0
 
     @property
     def session_id(self) -> int:
         return self._session_id
+
+    @property
+    def realtime_spoken_seconds(self) -> float:
+        """Seconds of speech the voice sent during this Talk, from output events."""
+        return max(0.0, self._realtime_spoken_seconds)
 
     @property
     def is_running(self) -> bool:
@@ -388,6 +397,8 @@ class VoiceSessionCoordinator:
         self.active_realtime_response_id = str(response_id or self.active_realtime_response_id or "")
         self.active_realtime_output_item_id = str(output_item_id or self.active_realtime_output_item_id or "")
         self.playback_active = True
+        if not self._realtime_output_started_at:
+            self._realtime_output_started_at = time.monotonic()
         self.mark_realtime_latency("first_assistant_audio")
         self.set_realtime_state("speaking", session_id=session_id)
 
@@ -403,6 +414,7 @@ class VoiceSessionCoordinator:
             self._emit("stale_realtime_output_done_ignored", detail=str(session_id))
             return
         self.playback_active = False
+        self._finish_realtime_output()
         self.active_realtime_response_id = ""
         self.active_realtime_output_item_id = ""
         self.barge_in_reason = ""
@@ -422,9 +434,16 @@ class VoiceSessionCoordinator:
             return False
         self.barge_in_reason = str(reason or "")
         self.playback_active = False
+        self._finish_realtime_output()
         self.mark_realtime_latency("barge_in")
         self.set_realtime_state("interrupted", detail=self.barge_in_reason, session_id=session_id)
         return True
+
+    def _finish_realtime_output(self) -> None:
+        """Add the speech that just ended to this Talk's spoken seconds."""
+        if self._realtime_output_started_at:
+            self._realtime_spoken_seconds += max(0.0, time.monotonic() - self._realtime_output_started_at)
+            self._realtime_output_started_at = 0.0
 
     def record_realtime_speech_started(self, *, session_id: int | None = None) -> None:
         if session_id is not None and session_id != self._session_id:
@@ -549,6 +568,8 @@ class VoiceSessionCoordinator:
         self._realtime_completed_speech_window_id = 0
         self._realtime_last_transcript_window_id = 0
         self._realtime_transcript_item_ids.clear()
+        self._realtime_output_started_at = 0.0
+        self._realtime_spoken_seconds = 0.0
         if not keep_latency:
             self._realtime_started_at = 0.0
             self._realtime_latency_marks = {}

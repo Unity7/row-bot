@@ -70,7 +70,12 @@ _SECRET_FIELDS = {
     ("accounts", "x.client_secret"): "X_CLIENT_SECRET",
 }
 _ENUMS = {
-    ("voice", "runtime.talk_provider"): {"local", "openai_realtime"},
+    ("voice", "runtime.talk_provider"): {
+        "gemini_live",
+        "openai_realtime",
+        "gpt_live",
+        "local",
+    },
     ("voice", "runtime.dictation_provider"): {"local"},
     ("voice", "runtime.speech_output_provider"): {"local"},
     ("voice", "runtime.realtime_voice"): {
@@ -599,6 +604,15 @@ def _write_json_setting(root: Path, page: str, field: str, value: Any) -> None:
         if page == "system" and field.startswith("remote_access."):
             document.setdefault("version", 2)
         _set_path(document, keys, value)
+        if page == "voice" and field == "runtime.talk_provider":
+            # A Talk voice and its model travel together, so the next press of
+            # Talk uses the picked voice rather than a stale model.  The old
+            # local fallback stays off: a cloud voice never drops to Whisper
+            # by itself (H2 R5).
+            from row_bot.voice.runtime import talk_model_for
+
+            _set_path(document, ("talk_model",), talk_model_for(str(value)))
+            _set_path(document, ("realtime_fallback_to_local",), False)
         _write_document(path, document)
     if page == "preferences" and field == "updates.channel":
         from row_bot import updater
