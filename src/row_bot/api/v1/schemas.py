@@ -8482,7 +8482,7 @@ class RealtimeSnapshot(WireModel):
     quiesced: bool
     expires_in_ms: int = Field(ge=0, le=120000)
     run_id: OpaqueId | None
-    transport: Literal["openai_realtime"]
+    transport: Literal["openai_realtime", "gemini_live"]
 
 
 class RealtimeStart(WireModel):
@@ -8490,6 +8490,8 @@ class RealtimeStart(WireModel):
     client_secret: str | None = Field(max_length=4096)
     secret_expires_in_ms: int = Field(ge=0, le=60000)
     exchange_available: bool = False
+    model: str = Field(default="", max_length=128)
+    connection_seconds: int = Field(default=0, ge=0, le=3600)
 
 
 class RealtimeEvent(WireModel):

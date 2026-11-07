@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
+import asyncio
 import hashlib
 import json
 import logging
 import math
+import os
 import time
 from typing import Any
 from uuid import uuid4
@@ -31,6 +33,31 @@ _VOICE_PRICES = {
     "gemini_live": (0.005, 0.018),
     "gpt_live": (0.05, 0.0),
 }
+# Only a Gemini talk runs past the old 10-minute cap: a 20-minute talk is the
+# point of session resumption.  The lease still renews every 120 s.
+DEFAULT_GEMINI_TALK_SECONDS = 7200
+# After conversation.stop is admitted, how long the voice may wait for the run's
+# producer to finish before it says only that the run is still stopping.
+CANCEL_CONFIRM_SECONDS = 10.0
+
+
+def talk_max_seconds(voice: str) -> float:
+    """How long one Talk may run: the Gemini default, else the old 10 minutes."""
+    if voice != "gemini_live":
+        return 600.0
+    try:
+        return float(os.environ.get("ROWBOT_TALK_MAX_SECONDS") or DEFAULT_GEMINI_TALK_SECONDS)
+    except ValueError:
+        return float(DEFAULT_GEMINI_TALK_SECONDS)
+
+
+def gemini_connection_seconds() -> int:
+    """How long one Gemini Live connection may last before the page resumes it."""
+    try:
+        value = int(os.environ.get("ROWBOT_GEMINI_CONNECTION_SECONDS") or 540)
+    except ValueError:
+        value = 540
+    return max(30, min(value, 3600))
 _EVENTS = frozenset({"connected", "disconnected", "fatal_error", "speech_started", "speech_stopped",
                      "transcript_final", "assistant_transcript_final", "function_call_ready",
                      "consult_fallback_needed", "output_started", "output_item_started", "response_done",
@@ -53,6 +80,8 @@ class RealtimeStart:
     snapshot: RealtimeSnapshot
     client_secret: str | None = field(repr=False)
     secret_expires_in_ms: int
+    model: str = ""
+    connection_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -100,6 +129,7 @@ class _RealtimeState:
     model: str = ""
     started_wall: float = 0.0
     handovers: int = 0
+    connections: int = 0
 
     def clear_private(self) -> None:
         self.secret = self.transcript = self.transcript_item = self.last_digest = ""
@@ -185,12 +215,16 @@ class ClientRealtimeTransport:
         return lease
 
     def _snapshot(self, lease) -> RealtimeSnapshot:
+        state = lease.realtime
+        voice = state.voice if state is not None else ""
+        transport = voice if voice in {"gemini_live", "openai_realtime"} else "openai_realtime"
         return RealtimeSnapshot(1, lease.handle,
             ("stopping" if lease.starting or lease.operation else "stopped") if lease.revoked
             else self.coordinator.realtime_state,
             not lease.starting and lease.operation is None,
-            max(0, int((min(lease.expires, lease.started_at + 600) - self._transport._clock()) * 1000)),
-            lease.run_id or None)
+            max(0, int((min(lease.expires, lease.started_at + talk_max_seconds(voice)) - self._transport._clock()) * 1000)),
+            lease.run_id or None,
+            transport)
 
     def start(self, owner: DictationOwner, *, request_id: str, validate: Callable[[], None], chat_context: dict | None = None) -> RealtimeStart:
         def prepare(admitted: Callable[[], None]) -> None:
@@ -203,7 +237,7 @@ class ClientRealtimeTransport:
                 raise _provider_error(exc) from None
             admitted()
             try:
-                value = provider.create_client_secret(expires_after_seconds=60)
+                value = provider.create_client_secret(expires_after_seconds=60, reason="start")
             except DictationError:
                 raise
             except Exception as exc:
@@ -238,8 +272,16 @@ class ClientRealtimeTransport:
         with self.coordinator._dictation_lock:
             lease = self._lease(owner, snapshot.handle)
             state = lease.realtime
-            return RealtimeStart(self._snapshot(lease), state.secret or None,
-                                 max(0, int((state.secret_expires - self._transport._clock()) * 1000)))
+            return self._start_answer(lease, state)
+
+    def _start_answer(self, lease, state: _RealtimeState) -> RealtimeStart:
+        return RealtimeStart(
+            self._snapshot(lease),
+            state.secret or None,
+            max(0, int((state.secret_expires - self._transport._clock()) * 1000)),
+            model=state.model,
+            connection_seconds=gemini_connection_seconds() if state.voice == "gemini_live" else 0,
+        )
 
     def snapshot(self, owner: DictationOwner, handle: DictationHandle, *, validate: Callable[[], None],
                  heartbeat: bool = False) -> RealtimeSnapshot:
@@ -247,8 +289,47 @@ class ClientRealtimeTransport:
         with self.coordinator._dictation_lock:
             lease = self._lease(owner, handle, active=False)
             if heartbeat and not lease.revoked:
-                lease.expires = min(self._transport._clock() + LEASE_SECONDS, lease.started_at + 600)
+                state = lease.realtime
+                cap = talk_max_seconds(state.voice if state is not None else "")
+                lease.expires = min(self._transport._clock() + LEASE_SECONDS, lease.started_at + cap)
             return self._snapshot(lease)
+
+    def token(self, owner: DictationOwner, handle: DictationHandle, *, validate: Callable[[], None]) -> RealtimeStart:
+        """Mint the next connection's one-use token (Gemini resumes the same session)."""
+        validate()
+        with self.coordinator._dictation_lock:
+            lease = self._lease(owner, handle)
+            state = lease.realtime
+            if not lease.ready or lease.operation is not None:
+                raise DictationError("voice_session_busy")
+            if state is None or state.voice != "gemini_live" or state.provider is None:
+                raise DictationError("voice_provider_unavailable")
+            provider = state.provider
+        try:
+            value = provider.create_client_secret(expires_after_seconds=60, reason="resume")
+        except DictationError:
+            raise
+        except Exception as exc:
+            raise _provider_error(exc) from None
+        secret = value.get("value") if isinstance(value, dict) else None
+        expiry = value.get("expires_at") if isinstance(value, dict) else None
+        if (not isinstance(secret, str) or not 1 <= len(secret) <= 4096
+                or type(expiry) not in {int, float} or not math.isfinite(expiry)):
+            raise DictationError("realtime_credential_unavailable")
+        remaining = min(60.0, expiry - self._wall_clock())
+        if remaining <= 0:
+            raise DictationError("realtime_credential_expired")
+        validate()
+        with self.coordinator._dictation_lock:
+            lease = self._lease(owner, handle)
+            state = lease.realtime
+            if state is None or state.voice != "gemini_live":
+                raise DictationError("voice_session_expired")
+            state.secret = secret
+            state.secret_expires = self._transport._clock() + remaining
+            logger.info("talk resumed: voice=gemini_live session=%s connection=%d",
+                        handle.lease_id, state.connections + 1)
+            return self._start_answer(lease, state)
 
     def exchange(self, owner: DictationOwner, handle: DictationHandle, *, offer: bytes,
                  validate: Callable[[], None]) -> bytes:
@@ -422,6 +503,7 @@ class ClientRealtimeTransport:
             if kind == "connected":
                 state.connected = True
                 state.secret = ""
+                state.connections += 1
                 self.coordinator.set_realtime_state("listening", session_id=handle.voice_session_id)
             elif kind in {"disconnected", "fatal_error"}:
                 with self.coordinator._dictation_lock:
@@ -454,12 +536,23 @@ class ClientRealtimeTransport:
                 # its legacy in-memory voice_control_queue mutation path.
                 bridge = VoiceAgentBridge(send_message=submit, active_generation=lambda: None,
                     surface="normal_chat", thread_id=owner.conversation_id)
+                if kind == "function_call_ready" and event.name in _HANDOVER_TOOLS:
+                    parsed_request = bridge._parse_arguments(event.arguments)
+                    chars = len(str(parsed_request.get("request") or parsed_request.get("text")
+                                    or parsed_request.get("action") or ""))
+                    logger.info("talk handover: voice=%s call=%s tool=%s request_chars=%d",
+                                state.voice, event.call_id, event.name, chars)
                 if kind == "function_call_ready" and event.name == "row_bot_agent_control":
                     parsed = bridge._parse_arguments(event.arguments)
                     action = str(parsed.get("action") or "status").strip().lower()
                     text = str(parsed.get("text") or "").strip()
-                    result = {"output": json.dumps(control(action if action in {"status", "cancel"} else "input",
-                                                           text or action), ensure_ascii=False)}
+                    cancel_handle = generation
+                    confirmed_run = _generation_id(generation) or lease.run_id
+                    control_result = control(action if action in {"status", "cancel"} else "input",
+                                             text or action)
+                    if isinstance(control_result, dict) and control_result.get("control") == "cancel":
+                        control_result = await self._cancel_result(state, cancel_handle, confirmed_run)
+                    result = {"output": json.dumps(control_result, ensure_ascii=False)}
                 elif kind == "function_call_ready":
                     result = await bridge.handle_realtime_function_call(name=event.name, call_id=event.call_id,
                                                                         arguments=event.arguments, queue_consult=queue)
@@ -498,6 +591,24 @@ class ClientRealtimeTransport:
         finally:
             with self.coordinator._dictation_lock:
                 self._transport._release(lease, operation)
+
+    async def _cancel_result(self, state: _RealtimeState, handle: Any, run_id: str) -> dict[str, Any]:
+        """Say "Stopped." only once the cancelled run's producer has finished (H2 S2).
+
+        The wait runs on a worker thread so the event loop keeps serving events.
+        A run that is already gone counts as finished.
+        """
+        finished = handle is None or handle.producer_done.is_set()
+        if not finished:
+            finished = await asyncio.to_thread(handle.producer_done.wait, CANCEL_CONFIRM_SECONDS)
+        if finished:
+            status = "stopped" if getattr(handle, "status", "") == "stopped" else "cancelled"
+            logger.info("talk cancel confirmed: voice=%s run=%s via=conversation.stop status=%s",
+                        state.voice, run_id or "unknown", status)
+            return {"status": "cancelled", "control": "cancel", "speakable": "Stopped."}
+        logger.info("talk cancel pending: voice=%s run=%s via=conversation.stop status=stopping",
+                    state.voice, run_id or "unknown")
+        return {"status": "stopping", "control": "cancel", "speakable": "Still stopping."}
 
     def stop(self, owner: DictationOwner, handle: DictationHandle, *, validate: Callable[[], None]) -> RealtimeSnapshot:
         validate()

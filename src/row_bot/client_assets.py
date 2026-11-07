@@ -218,7 +218,10 @@ def _shell_headers(content: bytes) -> dict[str, str]:
     return {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
             "Content-Security-Policy": "default-src 'self'; script-src 'self' " + hashes + "; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; "
+            # Gemini Live's browser connection carries only the server-minted
+            # one-use auth token; the Google API key never enters the page.
+            "connect-src 'self' wss://generativelanguage.googleapis.com; "
             "font-src 'self' data:; worker-src 'self'; manifest-src 'self'; object-src 'none'; "
             "frame-src 'self' blob: https://www.youtube-nocookie.com; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"}
 

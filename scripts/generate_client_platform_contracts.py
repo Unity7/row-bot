@@ -187,6 +187,7 @@ OPERATIONS = (
     ("post", "/conversations/{conversation_id}/voice/realtime/{lease_id}/stop", "DictationIdentity", "RealtimeSnapshot"),
     ("post", "/conversations/{conversation_id}/voice/realtime/{lease_id}/heartbeat", "DictationIdentity", "RealtimeSnapshot"),
     ("post", "/conversations/{conversation_id}/voice/realtime/{lease_id}/event", "RealtimeEventRequest", "RealtimeEventResult"),
+    ("post", "/conversations/{conversation_id}/voice/realtime/{lease_id}/token", "DictationIdentity", "RealtimeStart"),
     ("post", "/conversations/{conversation_id}/voice/realtime/{lease_id}/exchange", "bytes", "bytes"),
     ("get", "/conversations/{conversation_id}/voice/talk/{lease_id}/run", None, "VoiceRunView"),
     ("get", "/conversations/{conversation_id}/voice/realtime/{lease_id}/run", None, "VoiceRunView"),
@@ -1769,6 +1770,12 @@ export const startTalk = (base: string, proof: SessionProof, conversation: strin
   jsonRequest(base, `/conversations/${id(conversation)}/voice/talk`, 'TalkSnapshot', proof, 'POST', validateWire('TalkStart', body), undefined, signal);
 export const startRealtime = (base: string, proof: SessionProof, conversation: string, body: TalkStart, signal?: AbortSignal): Promise<RealtimeStart> =>
   jsonRequest(base, `/conversations/${id(conversation)}/voice/realtime`, 'RealtimeStart', proof, 'POST', validateWire('TalkStart', body), undefined, signal);
+export const realtimeToken = (base: string, proof: SessionProof, handle: DictationHandle, signal?: AbortSignal): Promise<RealtimeStart> => {
+  validateWire('DictationHandle', handle);
+  return jsonRequest(base, `/conversations/${id(handle.conversation_id)}/voice/realtime/${id(handle.lease_id)}/token`,
+    'RealtimeStart', proof, 'POST',
+    {voice_session_id: handle.voice_session_id, server_epoch: handle.server_epoch}, undefined, signal);
+};
 export function voiceControl<M extends 'talk' | 'realtime'>(base: string, proof: SessionProof, mode: M, handle: DictationHandle, action: 'stop' | 'heartbeat', signal?: AbortSignal): Promise<M extends 'talk' ? TalkSnapshot : RealtimeSnapshot> {
   validateWire('DictationHandle', handle);
   if (!['talk','realtime'].includes(mode) || !['stop','heartbeat'].includes(action)) throw new Error('invalid_command');

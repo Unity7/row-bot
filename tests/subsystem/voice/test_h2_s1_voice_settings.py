@@ -115,7 +115,7 @@ def test_an_unknown_talk_voice_is_refused():
         ("gemini_live", "gemini-3.8-live"),
         ("openai_realtime", "gpt-realtime-2.1"),
         ("gpt_live", "gpt-live-1"),
-        ("local", ""),
+        ("local", "local-whisper"),
     ],
 )
 def test_picking_a_voice_writes_its_provider_model_and_keeps_fallback_off(
@@ -211,7 +211,7 @@ def test_a_cloud_pick_before_s2_stops_instead_of_using_local(provider):
         )
 
 
-def test_realtime_factory_only_builds_openai_realtime(monkeypatch):
+def test_realtime_factory_builds_gemini_and_openai_and_refuses_the_rest(monkeypatch):
     from row_bot.voice.client_transport import DictationError
     from row_bot.voice import runtime
 
@@ -229,7 +229,18 @@ def test_realtime_factory_only_builds_openai_realtime(monkeypatch):
     assert provider.provider_id == "openai_realtime"
     assert provider.model == "gpt-realtime-2.1"
 
-    for provider_name in ("gemini_live", "gpt_live", "local"):
+    monkeypatch.setattr(
+        runtime,
+        "load_voice_runtime_settings",
+        lambda: runtime.VoiceRuntimeSettings(
+            talk_provider="gemini_live", talk_model="gemini-3.8-live"
+        ),
+    )
+    gemini = realtime_provider()
+    assert gemini.provider_id == "gemini_live"
+    assert gemini.model == "gemini-3.8-live"
+
+    for provider_name in ("gpt_live", "local"):
         monkeypatch.setattr(
             runtime,
             "load_voice_runtime_settings",

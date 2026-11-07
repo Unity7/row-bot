@@ -79,7 +79,10 @@
           "type": "string"
         },
         "transport": {
-          "const": "openai_realtime",
+          "enum": [
+            "openai_realtime",
+            "gemini_live"
+          ],
           "title": "Transport",
           "type": "string"
         }
@@ -111,10 +114,23 @@
       ],
       "title": "Client Secret"
     },
+    "connection_seconds": {
+      "default": 0,
+      "maximum": 3600,
+      "minimum": 0,
+      "title": "Connection Seconds",
+      "type": "integer"
+    },
     "exchange_available": {
       "default": false,
       "title": "Exchange Available",
       "type": "boolean"
+    },
+    "model": {
+      "default": "",
+      "maxLength": 128,
+      "title": "Model",
+      "type": "string"
     },
     "secret_expires_in_ms": {
       "maximum": 60000,

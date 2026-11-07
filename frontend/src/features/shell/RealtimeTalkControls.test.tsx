@@ -190,3 +190,44 @@ it('speech mute and captions remain presentation controls without provider calls
   expect(screen.queryByLabelText('Voice caption')).not.toBeInTheDocument();
   expect(p.event).not.toHaveBeenCalled();
 });
+
+it('keeps one data-session across resumed connections and shows the live state', async () => {
+  const p = props();
+  p.voice = 'gemini_live';
+  const live = {
+    ...started,
+    model: 'gemini-3.8-live',
+    connection_seconds: 120,
+    snapshot: { ...snapshot, transport: 'gemini_live' as const },
+  };
+  p.start = vi.fn().mockResolvedValue(live);
+  render(<RealtimeTalkControls {...p} />);
+  await start();
+  act(() => {
+    options.onStatus?.({ state: 'listening', queuedMs: 0, connections: 1 });
+  });
+  const controls = screen.getByTestId('talk-controls');
+  expect(controls.dataset.session).toBe(snapshot.handle.lease_id);
+  expect(controls.dataset.voice).toBe('gemini_live');
+  expect(controls.dataset.state).toBe('listening');
+  act(() => {
+    options.onStatus?.({ state: 'connecting', queuedMs: 0, connections: 2 });
+  });
+  expect(controls.dataset.session).toBe(snapshot.handle.lease_id);
+  expect(controls.dataset.connections).toBe('2');
+  expect(controls.dataset.state).toBe('connecting');
+});
+
+it('keeps every caption with its speaking role for the talk transcript', async () => {
+  const p = props();
+  render(<RealtimeTalkControls {...p} />);
+  await start();
+  act(() => {
+    options.onCaption('What is waiting on me?', 'user');
+    options.onCaption('Three things are waiting.', 'assistant');
+  });
+  const items = screen.getAllByRole('listitem');
+  expect(items.map((item) => item.dataset.role)).toEqual(['user', 'assistant']);
+  expect(items[0]).toHaveTextContent('What is waiting on me?');
+  expect(items[1]).toHaveTextContent('Three things are waiting.');
+});

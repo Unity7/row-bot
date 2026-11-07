@@ -33,7 +33,8 @@ def runtime():
     def submit(owner, text, event_id, validate):
         validate()
         calls.append(("submit", owner.conversation_id, text, event_id))
-        generation[0] = SimpleNamespace(generation_id="run-1", status="running", stop_event=threading.Event())
+        generation[0] = SimpleNamespace(generation_id="run-1", status="running", stop_event=threading.Event(),
+                                        producer_done=threading.Event())
         return "run-1"
 
     def control(owner, expected, action, text, event_id, validate):
@@ -42,6 +43,8 @@ def runtime():
         calls.append(("control", action, event_id))
         if action == "cancel":
             expected.stop_event.set()
+            expected.status = "stopped"
+            expected.producer_done.set()
             return {"control": "cancel", "status": "cancelled"}
         if action == "input":
             pending.append((owner.conversation_id, expected.generation_id, text, event_id))
@@ -72,7 +75,7 @@ def test_passive_adapter_and_exact_secret_replay_no_local_models(runtime):
     assert first.client_secret == "synthetic-ephemeral" and first.secret_expires_in_ms == 60_000
     assert first.snapshot.state == "connecting" and first.snapshot.quiesced
     assert start(r, request) == first
-    assert r.calls == [("secret", {"expires_after_seconds": 60})]
+    assert r.calls == [("secret", {"expires_after_seconds": 60, "reason": "start"})]
     with pytest.raises(DictationError, match="idempotency_mismatch"):
         r.transport.start(r.owner, request_id=request, validate=lambda: None)
     with pytest.raises(DictationError, match="voice_session_busy"):
