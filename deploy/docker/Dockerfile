@@ -23,6 +23,8 @@ COPY frontend ./
 COPY contracts/client-platform/v1/typescript /build/contracts/client-platform/v1/typescript
 # The frontend imports the shared realtime runtime from the Python package.
 COPY src/row_bot/voice/realtime_runtime.js src/row_bot/voice/realtime_runtime.d.ts /build/src/row_bot/voice/
+# The Gemini live voice API imports its runtime from the same Python package.
+COPY src/row_bot/voice/gemini_live_runtime.js src/row_bot/voice/gemini_live_runtime.d.ts /build/src/row_bot/voice/
 RUN npm run build \
     && node scripts/asset-manifest.mjs dist --package-dir /client-payload
 
