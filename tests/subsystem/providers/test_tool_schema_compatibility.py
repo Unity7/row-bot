@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from langchain_core.tools import StructuredTool
@@ -10,6 +10,7 @@ from row_bot.providers.models import TransportMode
 from row_bot.providers.tool_schema import (
     ToolSchemaCompatibilityError,
     apply_tool_schema_compatibility,
+    inspect_google_tool_schemas,
     inspect_tool_schema,
 )
 
@@ -46,6 +47,10 @@ class _DescriptionOnlyItemsArgs(BaseModel):
 
 class _StringOrArrayArgs(BaseModel):
     to: str | list[str]
+
+
+class _EmptyChoiceArgs(BaseModel):
+    mode: Literal["", "auto"] = ""
 
 
 def _tool(name: str, schema: type[BaseModel]) -> StructuredTool:
@@ -148,6 +153,47 @@ def test_empty_tool_list_remains_valid_for_google() -> None:
     assert result.enforced is True
     assert result.tools == ()
     assert result.issues == ()
+
+
+def test_google_reports_and_filters_an_empty_enum_choice() -> None:
+    """Gemini refuses an enum with an empty value, so the gate must catch it."""
+    empty_choice = _tool("empty_choice", _EmptyChoiceArgs)
+    valid = _tool("valid", _TypedArgs)
+
+    issues = inspect_google_tool_schemas([empty_choice])
+
+    assert [(issue.code, issue.path) for issue in issues["empty_choice"]] == [
+        ("enum_empty_value", "$.properties.mode.enum[0]"),
+    ]
+    result = apply_tool_schema_compatibility(
+        [empty_choice, valid],
+        TransportMode.GOOGLE_GENAI,
+    )
+    assert result.rejected_tool_names == ("empty_choice",)
+    assert result.tools == (valid,)
+
+
+def test_every_registered_tool_binds_to_gemini_without_an_empty_choice() -> None:
+    import importlib
+
+    from row_bot.tools import registry
+
+    # Optional tool modules stay unimported in test mode; chart_tool needs plotly.
+    for module_name in ("row_bot.tools.developer_tool", "row_bot.tools.chart_tool"):
+        importlib.import_module(module_name)
+    tools = [
+        tool
+        for owner in registry.get_all_tools()
+        for tool in owner.as_langchain_tools()
+    ]
+    names = {tool.name for tool in tools}
+
+    assert {"create_chart", "delegate_work", "developer_update_todos"} <= names
+    problems = {
+        name: [issue.format() for issue in issues]
+        for name, issues in inspect_google_tool_schemas(tools).items()
+    }
+    assert problems == {}
 
 
 def test_all_core_builtin_arrays_have_typed_items() -> None:
