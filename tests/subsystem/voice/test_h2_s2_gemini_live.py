@@ -73,6 +73,8 @@ def test_the_mint_body_locks_the_session_and_names_the_voice(monkeypatch, caplog
     assert "additionalProperties" not in consult["properties"]["request"]
     mask = body["fieldMask"].split(",")
     assert "sessionResumption" not in mask, "a locked sessionResumption would drop the resume handle"
+    assert "sessionResumption" not in setup, "the browser, not the token, carries resumption"
+    assert set(setup) == set(mask), "every setup field must be named in the field mask, or Google refuses the token"
     assert {"model", "generationConfig", "systemInstruction", "tools", "inputAudioTranscription",
             "outputAudioTranscription", "contextWindowCompression"} <= set(mask)
     assert caplog.records[-1].getMessage() == (
