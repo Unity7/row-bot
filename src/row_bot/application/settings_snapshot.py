@@ -1739,25 +1739,66 @@ SETTING_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
-def _saved_settings(sections: Mapping[str, Any]) -> dict[str, Any]:
+def _credential_identity(status: Mapping[str, Any] | None) -> dict[str, Any]:
+    """A saved credential's stable identity: stored or not, and its value fingerprint.
+
+    Readiness and connection state stay out: only what a save stores changes the
+    revision, so a credential turning ready in the background never does.
+    """
+
+    status = status if isinstance(status, Mapping) else {}
+    return {
+        "configured": status.get("configured") is True,
+        "fingerprint": _text(status.get("fingerprint"), 128),
+    }
+
+
+def _saved_switch(tool_id: str, saved: Mapping[str, Any]) -> bool | None:
+    """One saved tool switch, or None when nothing was saved (a stable default).
+
+    The runtime registry's enabled flags are live state, not saved state, so a
+    tool registering itself must never move the revision (H2).
+    """
+
+    value = saved.get(tool_id)
+    return bool(value) if isinstance(value, bool) else None
+
+
+def _saved_account_credential(
+    account_id: str, accounts: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """The saved credential identity for the accounts that store one here."""
+
+    if account_id == "x":
+        return {
+            "client_id": _credential_identity(_credential_status("X_CLIENT_ID")),
+            "client_secret": _credential_identity(_credential_status("X_CLIENT_SECRET")),
+        }
+    if account_id == "github":
+        return _credential_identity(accounts[account_id]["credential"])
+    return None
+
+
+def _saved_settings(
+    sections: Mapping[str, Any], saved_tools: Mapping[str, Any]
+) -> dict[str, Any]:
     """The settings a person can edit and save, for the conflict revision.
 
     Live status values (availability, counts, readiness, install flags,
     runtime and tunnel state, sign-in state, last-run and last-check times,
     plugin health, tool registration) stay in the snapshot the page shows but
     out of this projection: a background health check must never make a save
-    look stale (H2). Per-tracker rows stay in because deleting one is a saved
-    action whose review names them.
+    look stale (H2). Saved credentials and per-tracker identity stay in because
+    saving a credential and deleting a tracker are saved actions whose review
+    names them.
     """
 
     voice = sections["voice"]
     system = sections["system"]
     tracker = sections["tracker"]
-    knowledge = sections["knowledge"]
     documents = sections["documents"]
     tools = sections["tools"]
     accounts = sections["accounts"]
-    utilities = sections["utilities"]
     preferences = sections["preferences"]
     account_ids = tuple(key for key in accounts if key != "availability")
     return {
@@ -1783,27 +1824,37 @@ def _saved_settings(sections: Mapping[str, Any]) -> dict[str, Any]:
                 name: voice["tts"][name]
                 for name in ("enabled", "voice", "speed", "auto_speak")
             },
+            "openai_realtime_credential": _credential_identity(
+                voice["openai_realtime_credential"]
+            ),
         },
         "system": {
             "workspace": {
                 name: system["workspace"][name] for name in ("label", "configured")
             },
             "shell": {
-                name: system["shell"][name]
-                for name in ("enabled", "blocked_patterns", "allow_data_folder")
+                "enabled": _saved_switch("shell", saved_tools),
+                "blocked_patterns": system["shell"]["blocked_patterns"],
+                "allow_data_folder": system["shell"]["allow_data_folder"],
             },
-            "browser": {"enabled": system["browser"]["enabled"]},
+            "browser": {"enabled": _saved_switch("browser", saved_tools)},
             "computer_use": {
-                name: system["computer_use"][name]
-                for name in ("enabled", "disclosure_acknowledged", "system_binary_configured")
+                "enabled": _saved_switch("computer_use", saved_tools),
+                "disclosure_acknowledged": system["computer_use"][
+                    "disclosure_acknowledged"
+                ],
+                "system_binary_configured": system["computer_use"][
+                    "system_binary_configured"
+                ],
             },
             "file_operations": {
-                name: system["file_operations"][name]
-                for name in ("enabled", "selected")
+                "enabled": _saved_switch("filesystem", saved_tools),
+                "selected": system["file_operations"]["selected"],
             },
             "tunnel": {
-                name: system["tunnel"][name]
-                for name in ("provider", "main_app_enabled")
+                "provider": system["tunnel"]["provider"],
+                "main_app_enabled": system["tunnel"]["main_app_enabled"],
+                "credential": _credential_identity(system["tunnel"]["credential"]),
             },
             "remote_access": {
                 name: system["remote_access"][name]
@@ -1811,8 +1862,13 @@ def _saved_settings(sections: Mapping[str, Any]) -> dict[str, Any]:
             },
             "logging": {"level": system["logging"]["level"]},
         },
-        "tracker": {"enabled": tracker["enabled"], "items": tracker["items"]},
-        "knowledge": {"memory_enabled": knowledge["memory_enabled"]},
+        "tracker": {
+            "enabled": _saved_switch("tracker", saved_tools),
+            # Deletion review needs to know which trackers exist, never how many
+            # entries each has or when it last changed.
+            "items": sorted(item["tracker_id"] for item in tracker["items"]),
+        },
+        "knowledge": {"memory_enabled": _saved_switch("memory", saved_tools)},
         "documents": {
             "processing_model": documents["processing_model"],
             "embedding": {
@@ -1829,24 +1885,34 @@ def _saved_settings(sections: Mapping[str, Any]) -> dict[str, Any]:
         "tools": {
             "external_loading_mode": tools["external_loading_mode"],
             "enabled": {
-                item["tool_id"]: item["enabled"] for item in tools["items"]
+                tool_id: _saved_switch(tool_id, saved_tools)
+                for tool_id in _SEARCH_TOOL_PRESENTATION
+            },
+            "credentials": {
+                item["tool_id"]: {
+                    credential["name"]: _credential_identity(credential)
+                    for credential in item["credentials"]
+                }
+                for item in tools["items"]
+                if item["credentials"]
             },
         },
         "accounts": {
             account_id: {
-                name: accounts[account_id][name]
-                for name in (
-                    "enabled",
-                    "operations",
-                    "read_operations",
-                    "post_operations",
-                    "engage_operations",
-                )
+                "enabled": None
+                if account_id == "github"
+                else _saved_switch(account_id, saved_tools),
+                "operations": accounts[account_id]["operations"],
+                "read_operations": accounts[account_id]["read_operations"],
+                "post_operations": accounts[account_id]["post_operations"],
+                "engage_operations": accounts[account_id]["engage_operations"],
+                "credential": _saved_account_credential(account_id, accounts),
             }
             for account_id in account_ids
         },
         "utilities": {
-            item["utility_id"]: item["enabled"] for item in utilities["items"]
+            utility_id: _saved_switch(utility_id, saved_tools)
+            for utility_id in _UTILITY_PRESENTATION
         },
         "preferences": {
             "identity": {
@@ -1897,7 +1963,7 @@ def read_settings_snapshot(
     validate()
     return {
         "schema_version": 1,
-        "revision": _revision(_saved_settings(sections)),
+        "revision": _revision(_saved_settings(sections, tools)),
         **sections,
         # Defaults never change the revision: they are not saved state.
         "defaults": copy.deepcopy(SETTING_DEFAULTS),
