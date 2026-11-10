@@ -147,6 +147,7 @@ describe('Gemini Live browser runtime', () => {
     expect(socket.url).toContain('access_token=auth_tokens%2Fone');
     expect(socket.url).not.toContain('key=');
     expect(JSON.parse(socket.sent[0]).setup.model).toBe('models/gemini-3.8-live');
+    expect(JSON.parse(socket.sent[0]).setup.sessionResumption).toEqual({});
     expect(value.onStatus).toHaveBeenLastCalledWith({
       state: 'listening',
       queuedMs: 0,

@@ -1,10 +1,11 @@
 """Gemini Live Talk: the server mints a one-use auth token and the browser connects.
 
 The Google key never leaves this process: the token endpoint locks the model,
-audio replies, the voice, Row-Bot's instructions, both transcriptions, session
-resumption, context window compression and the three hand-off tools into one
-short-lived ``auth_tokens/...`` secret.  The browser sends it as the WebSocket's
-``access_token`` and can do nothing else with it.
+audio replies, the voice, Row-Bot's instructions, both transcriptions, context
+window compression and the three hand-off tools into one short-lived
+``auth_tokens/...`` secret.  Session resumption is left to the browser's own
+setup, so it can send its latest handle.  The browser sends the secret as the
+WebSocket's ``access_token`` and can do nothing else with it.
 """
 from __future__ import annotations
 
@@ -110,7 +111,11 @@ class GeminiLiveProvider:
         )
 
     def setup(self, *, instructions: str = "") -> dict[str, Any]:
-        """The locked session setup: audio replies, the voice, tools and resumption."""
+        """The locked session setup: audio replies, the voice and tools, never resumption.
+
+        The top-level keys must match LOCKED_FIELDS exactly, or Google rejects the
+        token with a field-mask error.  The browser adds sessionResumption itself.
+        """
         return {
             "model": f"models/{self.model}",
             "generationConfig": {
@@ -127,7 +132,6 @@ class GeminiLiveProvider:
             "tools": [{"functionDeclarations": gemini_bridge_tool_declarations()}],
             "inputAudioTranscription": {},
             "outputAudioTranscription": {},
-            "sessionResumption": {},
             "contextWindowCompression": {"slidingWindow": {}},
         }
 
