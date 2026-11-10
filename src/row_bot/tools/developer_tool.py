@@ -6,7 +6,7 @@ import hashlib
 import logging
 import pathlib
 import subprocess
-from typing import Literal
+from typing import Literal, Optional
 
 from langchain_core.tools import StructuredTool
 from langgraph.types import interrupt
@@ -295,12 +295,12 @@ def _diff(path: str = "", offset: int = 1, limit: int = PAGE_LINES) -> str:
 class _TodoInput(BaseModel):
     labels: list[str] = Field(default_factory=list, description="Todo labels to replace the current plan with.")
     todo_id: str = Field(default="", description="Existing todo id to update.")
-    status: Literal["", "pending", "in_progress", "completed", "blocked"] = Field(
-        default="", description="New status for todo_id."
+    status: Optional[Literal["pending", "in_progress", "completed", "blocked"]] = Field(
+        default=None, description="New status for todo_id. Omit to leave it unchanged."
     )
 
 
-def _update_todos(labels: list[str] | None = None, todo_id: str = "", status: str = "") -> str:
+def _update_todos(labels: list[str] | None = None, todo_id: str = "", status: str | None = "") -> str:
     thread_id = get_thread_id()
     if not thread_id:
         raise ValueError("No active Developer thread.")

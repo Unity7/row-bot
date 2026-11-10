@@ -192,6 +192,21 @@ def inspect_google_tool_schemas(
 
             def visit(node: Any, path: str) -> None:
                 if isinstance(node, Mapping):
+                    enum_values = node.get("enum")
+                    if isinstance(enum_values, list):
+                        for index, value in enumerate(enum_values):
+                            if isinstance(value, str) and not value:
+                                issues.append(
+                                    ToolSchemaIssue(
+                                        tool_name=tool_name,
+                                        path=f"{path}.enum[{index}]",
+                                        code="enum_empty_value",
+                                        detail=(
+                                            "Gemini conversion produced an enum choice "
+                                            "with an empty value"
+                                        ),
+                                    )
+                                )
                     if node.get("type") == types.Type.ARRAY:
                         items = node.get("items")
                         if not isinstance(items, Mapping) or not items:

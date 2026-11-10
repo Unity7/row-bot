@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import uuid
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
@@ -354,9 +354,9 @@ class _DelegateWorkInput(BaseModel):
         default=False,
         description="Run the child in its own local git Worktree when a git-backed Developer workspace is available.",
     )
-    workspace_mode: Literal["", "auto", "read_only", "single_writer", "worktree"] = Field(
-        default="",
-        description="Optional workspace mode override.",
+    workspace_mode: Optional[Literal["auto", "read_only", "single_writer", "worktree"]] = Field(
+        default=None,
+        description="Optional workspace mode override. Omit to use the profile's mode.",
     )
     wait: bool = Field(
         default=False,
@@ -467,7 +467,7 @@ def _delegate_work(
     developer_workspace_id: str = "",
     developer_workspace_path: str = "",
     use_worktree: bool = False,
-    workspace_mode: str = "",
+    workspace_mode: str | None = "",
     parent_run_id: str = "",
     parent_message_id: str = "",
     wait: bool = False,
@@ -613,7 +613,7 @@ def _delegate_work(
             approval_mode=str(runtime.get("approval_mode") or ""),
             developer_workspace_id=developer_workspace_id,
             use_worktree=use_worktree,
-            workspace_mode=workspace_mode,
+            workspace_mode=workspace_mode or "",
             orchestration_id=orchestration_id if not wait else "",
             orchestration_required=required,
             orchestration_dependencies=list(depends_on or []),
