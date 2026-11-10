@@ -128,3 +128,90 @@ def test_buddy_state_machine_keeps_other_pending_approval(monkeypatch, no_durabl
 
     assert still_pending.animation == "tap_glass"
     assert still_pending.message == "Second approval"
+
+
+def _tracker_database(path):
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE trackers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            unit TEXT,
+            icon TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE entries (
+            id TEXT PRIMARY KEY,
+            tracker_id TEXT NOT NULL REFERENCES trackers(id) ON DELETE CASCADE,
+            timestamp TEXT NOT NULL,
+            value TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_tracker_check_leaves_a_fresh_profile_without_a_database(
+    reload_for_data_dir, monkeypatch, tmp_path
+):
+    """H2: a health check must not create tracker.db; a fresh profile is "not set up"."""
+    from row_bot.tools import registry
+    from row_bot.status_checks import check_tracker
+
+    data = tmp_path / "fresh"
+    data.mkdir()
+    reload_for_data_dir(data, "row_bot.tools.tracker_tool")
+    monkeypatch.setattr(registry, "is_enabled", lambda _name: True)
+
+    result = check_tracker()
+
+    assert (result.name, result.status, result.detail) == (
+        "Tracker",
+        "inactive",
+        "Not set up",
+    )
+    assert not (data / "tracker" / "tracker.db").exists()
+
+
+def test_tracker_check_reads_an_existing_database_without_writing(
+    reload_for_data_dir, monkeypatch, tmp_path
+):
+    """An existing tracker database is read read-only and reported as saved."""
+    from row_bot.tools import registry
+    from row_bot.status_checks import check_tracker
+
+    data = tmp_path / "data"
+    path = data / "tracker" / "tracker.db"
+    _tracker_database(path)
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        INSERT INTO trackers VALUES
+            ('water', 'Water', 'counter', 'glasses', 'drop', '2026-01-01');
+        INSERT INTO entries VALUES
+            ('entry-1', 'water', '2026-01-02T09:00:00', '1', NULL, '2026-01-02');
+        """
+    )
+    connection.commit()
+    connection.close()
+    before = path.read_bytes()
+    reload_for_data_dir(data, "row_bot.tools.tracker_tool")
+    monkeypatch.setattr(registry, "is_enabled", lambda _name: True)
+
+    result = check_tracker()
+
+    assert (result.status, result.detail) == ("ok", "1 tracker · 1 entries")
+    assert path.read_bytes() == before
+    assert [item.name for item in path.parent.iterdir() if item.is_file()] == [
+        "tracker.db"
+    ]

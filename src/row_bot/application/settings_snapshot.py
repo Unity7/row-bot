@@ -1739,6 +1739,226 @@ SETTING_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
+def _credential_saved_at(name: str) -> str:
+    """When the keyring saved a credential, never its value.
+
+    A fingerprint keeps only the last four characters, so two keys that share
+    them look alike. The saved-at time tells those saves apart in the revision
+    without putting the secret itself in it.
+    """
+
+    try:
+        from row_bot.api_keys import key_status
+
+        return _text(key_status(name).get("updated_at"), 64)
+    except Exception:
+        return ""
+
+
+def _credential_identity(
+    status: Mapping[str, Any] | None, name: str = ""
+) -> dict[str, Any]:
+    """A saved credential's stable identity: stored or not, its value fingerprint,
+    and when the keyring saved it.
+
+    Readiness and connection state stay out: only what a save stores changes the
+    revision, so a credential turning ready in the background never does.
+    """
+
+    status = status if isinstance(status, Mapping) else {}
+    return {
+        "configured": status.get("configured") is True,
+        "fingerprint": _text(status.get("fingerprint"), 128),
+        "saved_at": _credential_saved_at(name) if name else "",
+    }
+
+
+def _saved_switch(tool_id: str, saved: Mapping[str, Any]) -> bool | None:
+    """One saved tool switch, or None when nothing was saved (a stable default).
+
+    The runtime registry's enabled flags are live state, not saved state, so a
+    tool registering itself must never move the revision (H2).
+    """
+
+    value = saved.get(tool_id)
+    return bool(value) if isinstance(value, bool) else None
+
+
+def _saved_account_credential(
+    account_id: str, accounts: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """The saved credential identity for the accounts that store one here."""
+
+    if account_id == "x":
+        return {
+            "client_id": _credential_identity(
+                _credential_status("X_CLIENT_ID"), "X_CLIENT_ID"
+            ),
+            "client_secret": _credential_identity(
+                _credential_status("X_CLIENT_SECRET"), "X_CLIENT_SECRET"
+            ),
+        }
+    if account_id == "github":
+        return _credential_identity(
+            accounts[account_id]["credential"], "GITHUB_TOKEN"
+        )
+    return None
+
+
+def _saved_settings(
+    sections: Mapping[str, Any], saved_tools: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The settings a person can edit and save, for the conflict revision.
+
+    Live status values (availability, counts, readiness, install flags,
+    runtime and tunnel state, sign-in state, last-run and last-check times,
+    plugin health, tool registration) stay in the snapshot the page shows but
+    out of this projection: a background health check must never make a save
+    look stale (H2). Saved credentials and per-tracker identity stay in because
+    saving a credential and deleting a tracker are saved actions whose review
+    names them.
+    """
+
+    voice = sections["voice"]
+    system = sections["system"]
+    tracker = sections["tracker"]
+    documents = sections["documents"]
+    tools = sections["tools"]
+    accounts = sections["accounts"]
+    preferences = sections["preferences"]
+    account_ids = tuple(key for key in accounts if key != "availability")
+    return {
+        "voice": {
+            "runtime": {
+                name: voice["runtime"][name]
+                for name in (
+                    "talk_provider",
+                    "talk_model",
+                    "dictation_provider",
+                    "dictation_model",
+                    "speech_output_provider",
+                    "speech_output_model",
+                    "speech_output_voice",
+                    "realtime_voice",
+                    "captions_enabled",
+                    "talk_auto_start",
+                    "realtime_fallback_to_local",
+                )
+            },
+            "local": {"whisper_model": voice["local"]["whisper_model"]},
+            "tts": {
+                name: voice["tts"][name]
+                for name in ("enabled", "voice", "speed", "auto_speak")
+            },
+            "openai_realtime_credential": _credential_identity(
+                voice["openai_realtime_credential"], "OPENAI_API_KEY"
+            ),
+        },
+        "system": {
+            "workspace": {
+                name: system["workspace"][name] for name in ("label", "configured")
+            },
+            "shell": {
+                "enabled": _saved_switch("shell", saved_tools),
+                "blocked_patterns": system["shell"]["blocked_patterns"],
+                "allow_data_folder": system["shell"]["allow_data_folder"],
+            },
+            "browser": {"enabled": _saved_switch("browser", saved_tools)},
+            "computer_use": {
+                "enabled": _saved_switch("computer_use", saved_tools),
+                "disclosure_acknowledged": system["computer_use"][
+                    "disclosure_acknowledged"
+                ],
+                "system_binary_configured": system["computer_use"][
+                    "system_binary_configured"
+                ],
+            },
+            "file_operations": {
+                "enabled": _saved_switch("filesystem", saved_tools),
+                "selected": system["file_operations"]["selected"],
+            },
+            "tunnel": {
+                "provider": system["tunnel"]["provider"],
+                "main_app_enabled": system["tunnel"]["main_app_enabled"],
+                "credential": _credential_identity(
+                    system["tunnel"]["credential"], "NGROK_AUTHTOKEN"
+                ),
+            },
+            "remote_access": {
+                name: system["remote_access"][name]
+                for name in ("listen_mode", "configured_origins")
+            },
+            "logging": {"level": system["logging"]["level"]},
+        },
+        "tracker": {
+            "enabled": _saved_switch("tracker", saved_tools),
+            # Deletion review needs to know which trackers exist, never how many
+            # entries each has or when it last changed.
+            "items": sorted(item["tracker_id"] for item in tracker["items"]),
+        },
+        "knowledge": {"memory_enabled": _saved_switch("memory", saved_tools)},
+        "documents": {
+            "processing_model": documents["processing_model"],
+            "embedding": {
+                name: documents["embedding"][name]
+                for name in (
+                    "provider",
+                    "local_model",
+                    "cloud_model",
+                    "dimension",
+                    "auto_unload",
+                )
+            },
+        },
+        "tools": {
+            "external_loading_mode": tools["external_loading_mode"],
+            "enabled": {
+                tool_id: _saved_switch(tool_id, saved_tools)
+                for tool_id in _SEARCH_TOOL_PRESENTATION
+            },
+            "credentials": {
+                item["tool_id"]: {
+                    credential["name"]: _credential_identity(
+                        credential, credential["name"]
+                    )
+                    for credential in item["credentials"]
+                }
+                for item in tools["items"]
+                if item["credentials"]
+            },
+        },
+        "accounts": {
+            account_id: {
+                "enabled": None
+                if account_id == "github"
+                else _saved_switch(account_id, saved_tools),
+                "operations": accounts[account_id]["operations"],
+                "read_operations": accounts[account_id]["read_operations"],
+                "post_operations": accounts[account_id]["post_operations"],
+                "engage_operations": accounts[account_id]["engage_operations"],
+                "credential": _saved_account_credential(account_id, accounts),
+            }
+            for account_id in account_ids
+        },
+        "utilities": {
+            utility_id: _saved_switch(utility_id, saved_tools)
+            for utility_id in _UTILITY_PRESENTATION
+        },
+        "preferences": {
+            "identity": {
+                name: preferences["identity"][name]
+                for name in ("name", "personality", "self_improvement_enabled")
+            },
+            "window_mode": preferences["window_mode"],
+            "dream_cycle": {
+                name: preferences["dream_cycle"][name]
+                for name in ("enabled", "window_start", "window_end")
+            },
+            "updates": {"channel": preferences["updates"]["channel"]},
+        },
+    }
+
+
 def _revision(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -1773,7 +1993,7 @@ def read_settings_snapshot(
     validate()
     return {
         "schema_version": 1,
-        "revision": _revision(sections),
+        "revision": _revision(_saved_settings(sections, tools)),
         **sections,
         # Defaults never change the revision: they are not saved state.
         "defaults": copy.deepcopy(SETTING_DEFAULTS),

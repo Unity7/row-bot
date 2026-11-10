@@ -35,6 +35,27 @@ def _tree(root: Path) -> dict[str, str]:
     }
 
 
+def _registered_tools(extra: dict[str, bool] | None = None):
+    enabled = {
+        "shell": True,
+        "tracker": False,
+        "gmail": True,
+        "calendar": False,
+        "x": False,
+        "web_search": True,
+        "calculator": True,
+    }
+    enabled.update(extra or {})
+    return {
+        name: {
+            "id": name,
+            "label": name.replace("_", " ").title(),
+            "enabled": value,
+        }
+        for name, value in enabled.items()
+    }
+
+
 def _seed_tracker(data: Path) -> Path:
     path = data / "tracker" / "tracker.db"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,34 +235,22 @@ def api(tmp_path, monkeypatch):
         {"channel": "beta", "last_check": "2026-01-02T03:04:05Z"},
     )
 
-    from row_bot import api_keys, tasks
+    from row_bot import api_keys, secret_store, tasks
     from row_bot.application import settings_snapshot
     from row_bot.runtime import admissions
+    from tests.subsystem.plugins.conftest import MemoryKeyring
 
     monkeypatch.setattr(api_keys, "DATA_DIR", data)
     monkeypatch.setattr(api_keys, "KEYS_PATH", data / "api_keys.json")
+    # The real saved-key path: a memory keyring behind the real api_keys
+    # metadata, so fingerprints are the real last four characters and every
+    # save carries the keyring's saved-at time.
+    monkeypatch.setattr(secret_store, "_backend_override", MemoryKeyring())
+    monkeypatch.setattr(api_keys, "_session_keys", {})
+    monkeypatch.setattr(api_keys, "_loaded_keys", {})
     monkeypatch.setattr(tasks, "_DB_PATH", tmp_path / "tasks.db")
     monkeypatch.setattr(tasks, "_SCHEMA_READY_PATH", None)
-    monkeypatch.setattr(
-        settings_snapshot,
-        "_registered_tools",
-        lambda: {
-            name: {
-                "id": name,
-                "label": name.replace("_", " ").title(),
-                "enabled": enabled,
-            }
-            for name, enabled in {
-                "shell": True,
-                "tracker": False,
-                "gmail": True,
-                "calendar": False,
-                "x": False,
-                "web_search": True,
-                "calculator": True,
-            }.items()
-        },
-    )
+    monkeypatch.setattr(settings_snapshot, "_registered_tools", _registered_tools)
     monkeypatch.setattr(
         settings_snapshot,
         "_document_vector_status",
@@ -258,16 +267,22 @@ def api(tmp_path, monkeypatch):
             "detail": "Synthetic model is available in the local cache.",
         },
     )
-    secret_state: dict[str, str] = {}
+    class SavedSecrets:
+        """Read saved keys back through the real api_keys path."""
 
-    def credential(name: str) -> dict[str, object]:
-        return {
-            "configured": name in secret_state,
-            "source": "session" if name in secret_state else "none",
-            "fingerprint": "masked" if name in secret_state else "",
-        }
+        def __getitem__(self, name: str) -> str:
+            value = api_keys.get_key(name)
+            if not value:
+                raise KeyError(name)
+            return value
 
-    monkeypatch.setattr(settings_snapshot, "_credential_status", credential)
+        def __contains__(self, name: object) -> bool:
+            return (
+                isinstance(name, str)
+                and api_keys.key_status(name)["configured"] is True
+            )
+
+    secret_state = SavedSecrets()
     monkeypatch.setattr(
         settings_snapshot,
         "_plugins",
@@ -286,12 +301,6 @@ def api(tmp_path, monkeypatch):
                 }
             ],
         },
-    )
-    monkeypatch.setattr(
-        api_keys, "set_key", lambda name, value: secret_state.__setitem__(name, value)
-    )
-    monkeypatch.setattr(
-        api_keys, "delete_key", lambda name: secret_state.pop(name, None)
     )
 
     admissions.instance_identity()
@@ -1381,17 +1390,12 @@ def test_tracker_delete_all_rejects_stale_review_without_deleting(api):
         "value": True,
     }
     review = _review(client, headers, request)
+    # Another tab adds a tracker after the review. Which trackers exist is the
+    # saved identity deletion review needs; entry activity alone is live status.
     connection = sqlite3.connect(path)
     connection.execute(
-        "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            "entry-concurrent",
-            "water",
-            "2026-01-04T09:00:00",
-            "1",
-            None,
-            "2026-01-04",
-        ),
+        "INSERT INTO trackers VALUES (?, ?, ?, ?, ?, ?)",
+        ("steps", "Steps", "counter", "steps", "walk", "2026-01-04"),
     )
     connection.commit()
     connection.close()
@@ -1401,8 +1405,8 @@ def test_tracker_delete_all_rejects_stale_review_without_deleting(api):
     assert response.status_code == 409
     assert response.json()["code"] == "settings_changed"
     connection = sqlite3.connect(path)
-    assert connection.execute("SELECT COUNT(*) FROM trackers").fetchone()[0] == 2
-    assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 3
+    assert connection.execute("SELECT COUNT(*) FROM trackers").fetchone()[0] == 3
+    assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 2
     connection.close()
 
 
@@ -1609,6 +1613,220 @@ def test_fresh_profile_reads_back_every_reported_default(tmp_path, monkeypatch):
     assert read_settings_snapshot()["revision"] == snapshot["revision"]
 
 
+def test_a_background_status_change_does_not_reject_a_voice_save(api):
+    """H2: a health check changes live status while the Voice page is open, and Save still works."""
+    client, headers, data, _ = api
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "voice",
+        "field": "runtime.realtime_voice",
+        "value": "cedar",
+    }
+    review = _review(client, headers, request)
+
+    # What a background check and other pages change without touching a saved
+    # setting: the tracker store appears (an empty database, as the check made
+    # on a fresh profile) and the update check stamps its time.
+    path = _seed_tracker(data)
+    connection = sqlite3.connect(path)
+    connection.execute("DELETE FROM entries")
+    connection.execute("DELETE FROM trackers")
+    connection.commit()
+    connection.close()
+    _write(
+        data / "update_config.json",
+        {"channel": "beta", "last_check": "2026-08-01T00:00:00Z"},
+    )
+
+    later = client.get(BASE, headers=headers).json()
+    assert later["tracker"]["availability"] == "available"
+    assert later["revision"] == snapshot["revision"]
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert json.loads((data / "voice_runtime_settings.json").read_text())[
+        "realtime_voice"
+    ] == "cedar"
+
+
+def test_two_edits_of_the_same_saved_setting_still_conflict(api):
+    """The revision still catches a real concurrent edit, not just a status change."""
+    client, headers, data, _ = api
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "voice",
+        "field": "runtime.realtime_voice",
+        "value": "cedar",
+    }
+    review = _review(client, headers, request)
+    # Another tab saves the same field first.
+    saved = json.loads((data / "voice_runtime_settings.json").read_text())
+    _write(data / "voice_runtime_settings.json", {**saved, "realtime_voice": "echo"})
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "settings_changed"
+    assert json.loads((data / "voice_runtime_settings.json").read_text())[
+        "realtime_voice"
+    ] == "echo"
+
+
+def test_two_edits_of_the_same_saved_credential_still_conflict(api):
+    """Review finding 1: a saved credential is saved state, including its removal."""
+    client, headers, _, secret_state = api
+    snapshot = client.get(BASE, headers=headers).json()
+    first = {
+        "settings_revision": snapshot["revision"],
+        "page": "tools",
+        "field": "web_search.credential",
+        "value": "tavily-first",
+    }
+    second = {**first, "value": "tavily-second"}
+    review_first = _review(client, headers, first)
+    review_second = _review(client, headers, second)
+
+    saved = _execute(client, headers, first, review_first)
+    assert saved.status_code == 200, saved.text
+    assert secret_state["TAVILY_API_KEY"] == "tavily-first"
+
+    # The second edit was reviewed at the same revision; the first save stales it.
+    stale = _execute(client, headers, second, review_second)
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "settings_changed"
+    assert secret_state["TAVILY_API_KEY"] == "tavily-first"
+
+    # Removing a credential is a saved change and moves the revision too.
+    current = client.get(BASE, headers=headers).json()
+    after_removal = {**first, "settings_revision": current["revision"]}
+    after_removal["value"] = "tavily-third"
+    stale_after_removal = _review(client, headers, after_removal)
+    removal = {
+        "settings_revision": current["revision"],
+        "page": "tools",
+        "field": "web_search.credential",
+        "value": None,
+    }
+    removed = _execute(client, headers, removal, _review(client, headers, removal))
+    assert removed.status_code == 200, removed.text
+    assert "TAVILY_API_KEY" not in secret_state
+
+    stale = _execute(client, headers, after_removal, stale_after_removal)
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "settings_changed"
+    assert "TAVILY_API_KEY" not in secret_state
+
+
+def test_two_credential_edits_with_the_same_last_four_characters_conflict(api):
+    """Review finding 1: the keyring's saved-at time tells two keys that share
+    their last four characters apart, so the second edit is stale, not applied."""
+    client, headers, _, secret_state = api
+    initial = {
+        "settings_revision": client.get(BASE, headers=headers).json()["revision"],
+        "page": "tools",
+        "field": "web_search.credential",
+        "value": "tavily-initial-1234",
+    }
+    saved = _execute(client, headers, initial, _review(client, headers, initial))
+    assert saved.status_code == 200, saved.text
+    assert secret_state["TAVILY_API_KEY"] == "tavily-initial-1234"
+
+    snapshot = client.get(BASE, headers=headers).json()
+    first = {
+        "settings_revision": snapshot["revision"],
+        "page": "tools",
+        "field": "web_search.credential",
+        "value": "tavily-first-1234",
+    }
+    second = {**first, "value": "tavily-second-1234"}
+    review_first = _review(client, headers, first)
+    review_second = _review(client, headers, second)
+
+    saved = _execute(client, headers, first, review_first)
+    assert saved.status_code == 200, saved.text
+    assert secret_state["TAVILY_API_KEY"] == "tavily-first-1234"
+
+    stale = _execute(client, headers, second, review_second)
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "settings_changed"
+    assert secret_state["TAVILY_API_KEY"] == "tavily-first-1234"
+
+
+def test_a_new_tracker_entry_does_not_reject_a_voice_save(api):
+    """Review finding 2: tracker activity is live status, not saved state."""
+    client, headers, data, _ = api
+    path = _seed_tracker(data)
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "voice",
+        "field": "runtime.realtime_voice",
+        "value": "cedar",
+    }
+    review = _review(client, headers, request)
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)",
+        ("entry-3", "water", "2026-01-04T09:00:00", "1", None, "2026-01-04"),
+    )
+    connection.commit()
+    connection.close()
+
+    later = client.get(BASE, headers=headers).json()
+    water = next(item for item in later["tracker"]["items"] if item["tracker_id"] == "water")
+    assert water["entry_count"] == 2
+    assert later["tracker"]["total_entries"] == 3
+    assert later["revision"] == snapshot["revision"]
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 200, response.text
+    assert json.loads((data / "voice_runtime_settings.json").read_text())[
+        "realtime_voice"
+    ] == "cedar"
+
+
+def test_registering_a_tool_does_not_reject_a_voice_save(api, monkeypatch):
+    """Review finding 3: switches hash saved configuration, not the live registry."""
+    from row_bot.application import settings_snapshot
+
+    client, headers, data, _ = api
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "voice",
+        "field": "runtime.realtime_voice",
+        "value": "cedar",
+    }
+    review = _review(client, headers, request)
+
+    # The runtime registers Weather as enabled; no saved file changes.
+    monkeypatch.setattr(
+        settings_snapshot,
+        "_registered_tools",
+        lambda: _registered_tools({"weather": True}),
+    )
+
+    later = client.get(BASE, headers=headers).json()
+    weather = next(
+        item for item in later["utilities"]["items"] if item["utility_id"] == "weather"
+    )
+    assert weather["enabled"] is True
+    assert later["revision"] == snapshot["revision"]
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 200, response.text
+    assert json.loads((data / "voice_runtime_settings.json").read_text())[
+        "realtime_voice"
+    ] == "cedar"
+
+
 def test_documents_pick_their_own_model_and_can_go_back_to_the_conversations(api):
     """U45: document processing uses the model chosen in the queue, not the last conversation's."""
     from row_bot.application.settings_snapshot import read_document_processing_model
@@ -1691,10 +1909,12 @@ def test_one_tracker_deletion_refuses_unknown_or_changed_trackers(api):
         "value": "water",
     }
     review = _review(client, headers, request)
+    # The tracked set changes after the review: a tracker appears. Which
+    # trackers exist is saved identity, so the reviewed deletion is stale.
     connection = sqlite3.connect(path)
     connection.execute(
-        "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)",
-        ("entry-concurrent", "water", "2026-01-04T09:00:00", "1", None, "2026-01-04"),
+        "INSERT INTO trackers VALUES (?, ?, ?, ?, ?, ?)",
+        ("steps", "Steps", "counter", "steps", "walk", "2026-01-04"),
     )
     connection.commit()
     connection.close()
@@ -1703,6 +1923,41 @@ def test_one_tracker_deletion_refuses_unknown_or_changed_trackers(api):
 
     assert response.status_code == 409
     assert response.json()["code"] == "settings_changed"
+    connection = sqlite3.connect(path)
+    assert connection.execute("SELECT COUNT(*) FROM trackers").fetchone()[0] == 3
+    assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 2
+    connection.close()
+
+
+def test_a_tracker_entry_added_after_its_deletion_review_is_a_conflict(api):
+    """Review finding 2: the deletion removes the entry count the review named,
+    so an entry that arrives after the review makes it a conflict."""
+    client, headers, data, _ = api
+    path = _seed_tracker(data)
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "tracker",
+        "field": "delete_tracker",
+        "value": "water",
+    }
+    review = _review(client, headers, request)
+    assert review["value_summary"] == (
+        "Delete the tracker \u201cWater\u201d and its 1 entry. This cannot be undone."
+    )
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)",
+        ("entry-3", "water", "2026-01-04T09:00:00", "1", None, "2026-01-04"),
+    )
+    connection.commit()
+    connection.close()
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "settings_review_changed"
     connection = sqlite3.connect(path)
     assert connection.execute("SELECT COUNT(*) FROM trackers").fetchone()[0] == 2
     assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 3
