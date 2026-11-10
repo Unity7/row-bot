@@ -1739,8 +1739,27 @@ SETTING_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
-def _credential_identity(status: Mapping[str, Any] | None) -> dict[str, Any]:
-    """A saved credential's stable identity: stored or not, and its value fingerprint.
+def _credential_saved_at(name: str) -> str:
+    """When the keyring saved a credential, never its value.
+
+    A fingerprint keeps only the last four characters, so two keys that share
+    them look alike. The saved-at time tells those saves apart in the revision
+    without putting the secret itself in it.
+    """
+
+    try:
+        from row_bot.api_keys import key_status
+
+        return _text(key_status(name).get("updated_at"), 64)
+    except Exception:
+        return ""
+
+
+def _credential_identity(
+    status: Mapping[str, Any] | None, name: str = ""
+) -> dict[str, Any]:
+    """A saved credential's stable identity: stored or not, its value fingerprint,
+    and when the keyring saved it.
 
     Readiness and connection state stay out: only what a save stores changes the
     revision, so a credential turning ready in the background never does.
@@ -1750,6 +1769,7 @@ def _credential_identity(status: Mapping[str, Any] | None) -> dict[str, Any]:
     return {
         "configured": status.get("configured") is True,
         "fingerprint": _text(status.get("fingerprint"), 128),
+        "saved_at": _credential_saved_at(name) if name else "",
     }
 
 
@@ -1771,11 +1791,17 @@ def _saved_account_credential(
 
     if account_id == "x":
         return {
-            "client_id": _credential_identity(_credential_status("X_CLIENT_ID")),
-            "client_secret": _credential_identity(_credential_status("X_CLIENT_SECRET")),
+            "client_id": _credential_identity(
+                _credential_status("X_CLIENT_ID"), "X_CLIENT_ID"
+            ),
+            "client_secret": _credential_identity(
+                _credential_status("X_CLIENT_SECRET"), "X_CLIENT_SECRET"
+            ),
         }
     if account_id == "github":
-        return _credential_identity(accounts[account_id]["credential"])
+        return _credential_identity(
+            accounts[account_id]["credential"], "GITHUB_TOKEN"
+        )
     return None
 
 
@@ -1825,7 +1851,7 @@ def _saved_settings(
                 for name in ("enabled", "voice", "speed", "auto_speak")
             },
             "openai_realtime_credential": _credential_identity(
-                voice["openai_realtime_credential"]
+                voice["openai_realtime_credential"], "OPENAI_API_KEY"
             ),
         },
         "system": {
@@ -1854,7 +1880,9 @@ def _saved_settings(
             "tunnel": {
                 "provider": system["tunnel"]["provider"],
                 "main_app_enabled": system["tunnel"]["main_app_enabled"],
-                "credential": _credential_identity(system["tunnel"]["credential"]),
+                "credential": _credential_identity(
+                    system["tunnel"]["credential"], "NGROK_AUTHTOKEN"
+                ),
             },
             "remote_access": {
                 name: system["remote_access"][name]
@@ -1890,7 +1918,9 @@ def _saved_settings(
             },
             "credentials": {
                 item["tool_id"]: {
-                    credential["name"]: _credential_identity(credential)
+                    credential["name"]: _credential_identity(
+                        credential, credential["name"]
+                    )
                     for credential in item["credentials"]
                 }
                 for item in tools["items"]

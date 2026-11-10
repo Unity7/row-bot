@@ -235,12 +235,19 @@ def api(tmp_path, monkeypatch):
         {"channel": "beta", "last_check": "2026-01-02T03:04:05Z"},
     )
 
-    from row_bot import api_keys, tasks
+    from row_bot import api_keys, secret_store, tasks
     from row_bot.application import settings_snapshot
     from row_bot.runtime import admissions
+    from tests.subsystem.plugins.conftest import MemoryKeyring
 
     monkeypatch.setattr(api_keys, "DATA_DIR", data)
     monkeypatch.setattr(api_keys, "KEYS_PATH", data / "api_keys.json")
+    # The real saved-key path: a memory keyring behind the real api_keys
+    # metadata, so fingerprints are the real last four characters and every
+    # save carries the keyring's saved-at time.
+    monkeypatch.setattr(secret_store, "_backend_override", MemoryKeyring())
+    monkeypatch.setattr(api_keys, "_session_keys", {})
+    monkeypatch.setattr(api_keys, "_loaded_keys", {})
     monkeypatch.setattr(tasks, "_DB_PATH", tmp_path / "tasks.db")
     monkeypatch.setattr(tasks, "_SCHEMA_READY_PATH", None)
     monkeypatch.setattr(settings_snapshot, "_registered_tools", _registered_tools)
@@ -260,19 +267,22 @@ def api(tmp_path, monkeypatch):
             "detail": "Synthetic model is available in the local cache.",
         },
     )
-    secret_state: dict[str, str] = {}
+    class SavedSecrets:
+        """Read saved keys back through the real api_keys path."""
 
-    def credential(name: str) -> dict[str, object]:
-        value = secret_state.get(name)
-        return {
-            "configured": value is not None,
-            "source": "session" if value is not None else "none",
-            "fingerprint": hashlib.sha256(value.encode()).hexdigest()[:16]
-            if value is not None
-            else "",
-        }
+        def __getitem__(self, name: str) -> str:
+            value = api_keys.get_key(name)
+            if not value:
+                raise KeyError(name)
+            return value
 
-    monkeypatch.setattr(settings_snapshot, "_credential_status", credential)
+        def __contains__(self, name: object) -> bool:
+            return (
+                isinstance(name, str)
+                and api_keys.key_status(name)["configured"] is True
+            )
+
+    secret_state = SavedSecrets()
     monkeypatch.setattr(
         settings_snapshot,
         "_plugins",
@@ -291,12 +301,6 @@ def api(tmp_path, monkeypatch):
                 }
             ],
         },
-    )
-    monkeypatch.setattr(
-        api_keys, "set_key", lambda name, value: secret_state.__setitem__(name, value)
-    )
-    monkeypatch.setattr(
-        api_keys, "delete_key", lambda name: secret_state.pop(name, None)
     )
 
     admissions.instance_identity()
@@ -1717,6 +1721,41 @@ def test_two_edits_of_the_same_saved_credential_still_conflict(api):
     assert "TAVILY_API_KEY" not in secret_state
 
 
+def test_two_credential_edits_with_the_same_last_four_characters_conflict(api):
+    """Review finding 1: the keyring's saved-at time tells two keys that share
+    their last four characters apart, so the second edit is stale, not applied."""
+    client, headers, _, secret_state = api
+    initial = {
+        "settings_revision": client.get(BASE, headers=headers).json()["revision"],
+        "page": "tools",
+        "field": "web_search.credential",
+        "value": "tavily-initial-1234",
+    }
+    saved = _execute(client, headers, initial, _review(client, headers, initial))
+    assert saved.status_code == 200, saved.text
+    assert secret_state["TAVILY_API_KEY"] == "tavily-initial-1234"
+
+    snapshot = client.get(BASE, headers=headers).json()
+    first = {
+        "settings_revision": snapshot["revision"],
+        "page": "tools",
+        "field": "web_search.credential",
+        "value": "tavily-first-1234",
+    }
+    second = {**first, "value": "tavily-second-1234"}
+    review_first = _review(client, headers, first)
+    review_second = _review(client, headers, second)
+
+    saved = _execute(client, headers, first, review_first)
+    assert saved.status_code == 200, saved.text
+    assert secret_state["TAVILY_API_KEY"] == "tavily-first-1234"
+
+    stale = _execute(client, headers, second, review_second)
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "settings_changed"
+    assert secret_state["TAVILY_API_KEY"] == "tavily-first-1234"
+
+
 def test_a_new_tracker_entry_does_not_reject_a_voice_save(api):
     """Review finding 2: tracker activity is live status, not saved state."""
     client, headers, data, _ = api
@@ -1887,6 +1926,41 @@ def test_one_tracker_deletion_refuses_unknown_or_changed_trackers(api):
     connection = sqlite3.connect(path)
     assert connection.execute("SELECT COUNT(*) FROM trackers").fetchone()[0] == 3
     assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 2
+    connection.close()
+
+
+def test_a_tracker_entry_added_after_its_deletion_review_is_a_conflict(api):
+    """Review finding 2: the deletion removes the entry count the review named,
+    so an entry that arrives after the review makes it a conflict."""
+    client, headers, data, _ = api
+    path = _seed_tracker(data)
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "tracker",
+        "field": "delete_tracker",
+        "value": "water",
+    }
+    review = _review(client, headers, request)
+    assert review["value_summary"] == (
+        "Delete the tracker \u201cWater\u201d and its 1 entry. This cannot be undone."
+    )
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)",
+        ("entry-3", "water", "2026-01-04T09:00:00", "1", None, "2026-01-04"),
+    )
+    connection.commit()
+    connection.close()
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "settings_review_changed"
+    connection = sqlite3.connect(path)
+    assert connection.execute("SELECT COUNT(*) FROM trackers").fetchone()[0] == 2
+    assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 3
     connection.close()
 
 

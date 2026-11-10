@@ -388,6 +388,21 @@ def _intent(
     }
 
 
+def _action_digest(intent: Mapping[str, Any], entry_count: int | None = None) -> str:
+    """The reviewed action's digest, including the tracker entry count it names.
+
+    A tracker deletion names how many entries it removes. The entry count stays
+    out of the settings revision (tracker activity is live state), so it goes in
+    this digest: an entry that arrives after the review changes the digest and
+    the deletion is refused instead of removing more than was named.
+    """
+
+    payload = {key: item for key, item in intent.items() if key != "secret"}
+    if entry_count is not None:
+        payload["entry_count"] = entry_count
+    return admissions.keyed_digest(payload)
+
+
 def review_settings_update(
     settings_revision: str,
     page: str,
@@ -417,8 +432,12 @@ def review_settings_update(
         )
         if intent["value"] == other:
             raise SettingsCommandError("invalid_settings_command")
-    digest = admissions.keyed_digest(
-        {key: item for key, item in intent.items() if key != "secret"}
+    reviewed_tracker: dict[str, Any] | None = None
+    if (page, field) == ("tracker", "delete_tracker"):
+        reviewed_tracker = _saved_tracker(current, intent["value"])
+    digest = _action_digest(
+        intent,
+        None if reviewed_tracker is None else reviewed_tracker["entry_count"],
     )
     if (page, field) in _RETIRED_FIELDS:
         summary = "This setting was removed; nothing changes"
@@ -438,7 +457,7 @@ def review_settings_update(
             "This cannot be undone."
         )
     elif (page, field) == ("tracker", "delete_tracker"):
-        tracker = _saved_tracker(current, intent["value"])
+        tracker = reviewed_tracker or _saved_tracker(current, intent["value"])
         entries = tracker["entry_count"]
         name = tracker["name"] if len(tracker["name"]) <= 120 else tracker["name"][:119] + "\u2026"
         summary = (
@@ -708,10 +727,21 @@ def _saved_tracker(snapshot: dict[str, Any], tracker_id: str) -> dict[str, Any]:
 
 
 def _delete_tracker(
-    root: Path, settings_revision: str, tracker_id: str, *, validate: Callable[[], None]
+    root: Path,
+    intent: Mapping[str, Any],
+    *,
+    validate: Callable[[], None],
+    expected_digest: str | None = None,
 ) -> None:
-    """Atomically delete one reviewed tracker and its entries."""
+    """Atomically delete one reviewed tracker and its entries.
 
+    The reviewed digest names the entry count the review showed, so an entry
+    that arrived since then is a conflict here even though tracker activity
+    never moves the settings revision.
+    """
+
+    settings_revision = intent["settings_revision"]
+    tracker_id = intent["value"]
     path = root / "tracker" / "tracker.db"
     if not path.is_file():
         raise SettingsCommandError("settings_changed")
@@ -724,7 +754,11 @@ def _delete_tracker(
         current = read_settings_snapshot(validate=validate)
         if current["revision"] != settings_revision:
             raise SettingsCommandError("settings_changed", current["revision"])
-        _saved_tracker(current, tracker_id)
+        tracker = _saved_tracker(current, tracker_id)
+        if expected_digest is not None and (
+            _action_digest(intent, tracker["entry_count"]) != expected_digest
+        ):
+            raise SettingsCommandError("settings_changed", current["revision"])
         connection.execute("DELETE FROM entries WHERE tracker_id = ?", (tracker_id,))
         deleted = connection.execute(
             "DELETE FROM trackers WHERE id = ?", (tracker_id,)
@@ -969,6 +1003,7 @@ def _apply(
     *,
     validate: Callable[[], None],
     resolve_folder_grant: Callable[[str], str] | None = None,
+    expected_digest: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
     validate()
     root = get_row_bot_data_dir(create=False).absolute()
@@ -979,7 +1014,9 @@ def _apply(
     elif (page, field) == ("tracker", "delete_all"):
         _clear_tracker_data(root, intent["settings_revision"], validate=validate)
     elif (page, field) == ("tracker", "delete_tracker"):
-        _delete_tracker(root, intent["settings_revision"], value, validate=validate)
+        _delete_tracker(
+            root, intent, validate=validate, expected_digest=expected_digest
+        )
     elif (page, field) == ("system", "computer_use.disclosure_acknowledged"):
         from row_bot.computer_use.readiness import (
             acknowledge_disclosure,
@@ -1145,6 +1182,7 @@ def execute_settings_update(
             intent,
             validate=validate,
             resolve_folder_grant=resolve_folder_grant,
+            expected_digest=payload["action_digest"],
         )
         result = {
             "command_id": command_id,
