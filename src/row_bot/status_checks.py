@@ -729,17 +729,25 @@ def check_skills() -> CheckResult:
 
 
 def check_tracker() -> CheckResult:
-    """Check habit/activity tracker state."""
+    """Check habit/activity tracker state without creating its database."""
     try:
         from row_bot.tools import registry as _tool_reg
         enabled = _tool_reg.is_enabled("tracker")
-        from row_bot.tools.tracker_tool import _get_db, _get_all_trackers
-        conn = _get_db()
+        path = get_row_bot_data_dir(create=False).absolute() / "tracker" / "tracker.db"
+        if not path.is_file():
+            # A health check must not create state: an absent database means
+            # the tracker was never used, not that it is empty (H2).
+            return CheckResult("Tracker", "inactive", "Not set up", settings_tab="Tracker")
+        from row_bot.tools.tracker_tool import _get_all_trackers
+        connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1
+        )
         try:
-            trackers = _get_all_trackers(conn)
-            total_entries = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            connection.execute("PRAGMA query_only = ON")
+            trackers = _get_all_trackers(connection)
+            total_entries = connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
         finally:
-            conn.close()
+            connection.close()
         status = "ok" if enabled else "inactive"
         detail = f"{len(trackers)} tracker{'s' if len(trackers) != 1 else ''} · {total_entries} entries"
         if not enabled:

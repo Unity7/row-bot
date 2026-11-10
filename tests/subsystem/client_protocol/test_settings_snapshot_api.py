@@ -1609,6 +1609,71 @@ def test_fresh_profile_reads_back_every_reported_default(tmp_path, monkeypatch):
     assert read_settings_snapshot()["revision"] == snapshot["revision"]
 
 
+def test_a_background_status_change_does_not_reject_a_voice_save(api):
+    """H2: a health check changes live status while the Voice page is open, and Save still works."""
+    client, headers, data, secret_state = api
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "voice",
+        "field": "runtime.realtime_voice",
+        "value": "cedar",
+    }
+    review = _review(client, headers, request)
+
+    # What a background check and other pages change without touching a saved
+    # setting: the tracker store appears (an empty database, as the check made
+    # on a fresh profile), the update check stamps its time, and a credential
+    # becomes ready.
+    path = _seed_tracker(data)
+    connection = sqlite3.connect(path)
+    connection.execute("DELETE FROM entries")
+    connection.execute("DELETE FROM trackers")
+    connection.commit()
+    connection.close()
+    _write(
+        data / "update_config.json",
+        {"channel": "beta", "last_check": "2026-08-01T00:00:00Z"},
+    )
+    secret_state["OPENAI_API_KEY"] = "synthetic-key"
+
+    later = client.get(BASE, headers=headers).json()
+    assert later["tracker"]["availability"] == "available"
+    assert later["revision"] == snapshot["revision"]
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert json.loads((data / "voice_runtime_settings.json").read_text())[
+        "realtime_voice"
+    ] == "cedar"
+
+
+def test_two_edits_of_the_same_saved_setting_still_conflict(api):
+    """The revision still catches a real concurrent edit, not just a status change."""
+    client, headers, data, _ = api
+    snapshot = client.get(BASE, headers=headers).json()
+    request = {
+        "settings_revision": snapshot["revision"],
+        "page": "voice",
+        "field": "runtime.realtime_voice",
+        "value": "cedar",
+    }
+    review = _review(client, headers, request)
+    # Another tab saves the same field first.
+    saved = json.loads((data / "voice_runtime_settings.json").read_text())
+    _write(data / "voice_runtime_settings.json", {**saved, "realtime_voice": "echo"})
+
+    response = _execute(client, headers, request, review)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "settings_changed"
+    assert json.loads((data / "voice_runtime_settings.json").read_text())[
+        "realtime_voice"
+    ] == "echo"
+
+
 def test_documents_pick_their_own_model_and_can_go_back_to_the_conversations(api):
     """U45: document processing uses the model chosen in the queue, not the last conversation's."""
     from row_bot.application.settings_snapshot import read_document_processing_model

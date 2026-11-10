@@ -1739,6 +1739,130 @@ SETTING_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
+def _saved_settings(sections: Mapping[str, Any]) -> dict[str, Any]:
+    """The settings a person can edit and save, for the conflict revision.
+
+    Live status values (availability, counts, readiness, install flags,
+    runtime and tunnel state, sign-in state, last-run and last-check times,
+    plugin health, tool registration) stay in the snapshot the page shows but
+    out of this projection: a background health check must never make a save
+    look stale (H2). Per-tracker rows stay in because deleting one is a saved
+    action whose review names them.
+    """
+
+    voice = sections["voice"]
+    system = sections["system"]
+    tracker = sections["tracker"]
+    knowledge = sections["knowledge"]
+    documents = sections["documents"]
+    tools = sections["tools"]
+    accounts = sections["accounts"]
+    utilities = sections["utilities"]
+    preferences = sections["preferences"]
+    account_ids = tuple(key for key in accounts if key != "availability")
+    return {
+        "voice": {
+            "runtime": {
+                name: voice["runtime"][name]
+                for name in (
+                    "talk_provider",
+                    "talk_model",
+                    "dictation_provider",
+                    "dictation_model",
+                    "speech_output_provider",
+                    "speech_output_model",
+                    "speech_output_voice",
+                    "realtime_voice",
+                    "captions_enabled",
+                    "talk_auto_start",
+                    "realtime_fallback_to_local",
+                )
+            },
+            "local": {"whisper_model": voice["local"]["whisper_model"]},
+            "tts": {
+                name: voice["tts"][name]
+                for name in ("enabled", "voice", "speed", "auto_speak")
+            },
+        },
+        "system": {
+            "workspace": {
+                name: system["workspace"][name] for name in ("label", "configured")
+            },
+            "shell": {
+                name: system["shell"][name]
+                for name in ("enabled", "blocked_patterns", "allow_data_folder")
+            },
+            "browser": {"enabled": system["browser"]["enabled"]},
+            "computer_use": {
+                name: system["computer_use"][name]
+                for name in ("enabled", "disclosure_acknowledged", "system_binary_configured")
+            },
+            "file_operations": {
+                name: system["file_operations"][name]
+                for name in ("enabled", "selected")
+            },
+            "tunnel": {
+                name: system["tunnel"][name]
+                for name in ("provider", "main_app_enabled")
+            },
+            "remote_access": {
+                name: system["remote_access"][name]
+                for name in ("listen_mode", "configured_origins")
+            },
+            "logging": {"level": system["logging"]["level"]},
+        },
+        "tracker": {"enabled": tracker["enabled"], "items": tracker["items"]},
+        "knowledge": {"memory_enabled": knowledge["memory_enabled"]},
+        "documents": {
+            "processing_model": documents["processing_model"],
+            "embedding": {
+                name: documents["embedding"][name]
+                for name in (
+                    "provider",
+                    "local_model",
+                    "cloud_model",
+                    "dimension",
+                    "auto_unload",
+                )
+            },
+        },
+        "tools": {
+            "external_loading_mode": tools["external_loading_mode"],
+            "enabled": {
+                item["tool_id"]: item["enabled"] for item in tools["items"]
+            },
+        },
+        "accounts": {
+            account_id: {
+                name: accounts[account_id][name]
+                for name in (
+                    "enabled",
+                    "operations",
+                    "read_operations",
+                    "post_operations",
+                    "engage_operations",
+                )
+            }
+            for account_id in account_ids
+        },
+        "utilities": {
+            item["utility_id"]: item["enabled"] for item in utilities["items"]
+        },
+        "preferences": {
+            "identity": {
+                name: preferences["identity"][name]
+                for name in ("name", "personality", "self_improvement_enabled")
+            },
+            "window_mode": preferences["window_mode"],
+            "dream_cycle": {
+                name: preferences["dream_cycle"][name]
+                for name in ("enabled", "window_start", "window_end")
+            },
+            "updates": {"channel": preferences["updates"]["channel"]},
+        },
+    }
+
+
 def _revision(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -1773,7 +1897,7 @@ def read_settings_snapshot(
     validate()
     return {
         "schema_version": 1,
-        "revision": _revision(sections),
+        "revision": _revision(_saved_settings(sections)),
         **sections,
         # Defaults never change the revision: they are not saved state.
         "defaults": copy.deepcopy(SETTING_DEFAULTS),
